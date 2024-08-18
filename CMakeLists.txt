@@ -1,7 +1,9 @@
 cmake_minimum_required(VERSION 3.7)
 
-set(PROJECT_NAME MiniFB)
-project(${PROJECT_NAME})
+set(PROJECT_NAME MiniFB-native)
+set(PROJECT_VERSION 0.7.0)
+
+project(${PROJECT_NAME} VERSION ${PROJECT_VERSION})
 
 message(STATUS "Processing " ${PROJECT_NAME})
 
@@ -22,11 +24,11 @@ endif()
 #--------------------------------------
 set(SrcLib
     include/MiniFB.h
-    include/MiniFB_cpp.h
+    include/MiniFB_version.h
     include/MiniFB_enums.h
 
+    src/MiniFB_version.c
     src/MiniFB_common.c
-    src/MiniFB_cpp.cpp
     src/MiniFB_internal.c
     src/MiniFB_internal.h
     src/MiniFB_timer.c
@@ -99,8 +101,6 @@ set_property(GLOBAL PROPERTY USE_FOLDERS ON)
 
 # Code generation options
 #--------------------------------------
-option(MINIFB_BUILD_EXAMPLES "Build minifb example programs" TRUE)
-option(MINIFB_AVOID_CPP_HEADERS "Avoid including C++ Headers" FALSE)
 
 if(APPLE AND NOT IOS)
     option(USE_METAL_API "Build the project using metal API code" ON)
@@ -140,7 +140,7 @@ if(NOT MSVC)
     # Set our flags
     #--------------------------------------
     add_compile_options("$<$<CONFIG:Debug>:-g>")
-    add_compile_options("$<IF:$<CONFIG:Debug>,-O0,-O2>")
+    add_compile_options("$<IF:$<CONFIG:Debug>,-O0,-O3>")
     add_compile_options(-Wall -Wextra)
     add_compile_options(-Wno-switch -Wno-unused-function -Wno-unused-parameter -Wno-implicit-fallthrough)
 
@@ -168,7 +168,11 @@ else()
     # Optimizations
     add_compile_options("$<IF:$<CONFIG:Debug>,/Od,/O2>")
     # Inline function expansion
-    add_compile_options("$<IF:$<CONFIG:Debug>,/Ob0,/Ob2>")
+    if (MSVC_VERSION GREATER_EQUAL 1920)
+        add_compile_options("$<IF:$<CONFIG:Debug>,/Ob0,/Ob3>")
+    else()
+        add_compile_options("$<IF:$<CONFIG:Debug>,/Ob0,/Ob2>")
+    endif()
     # Basic runtime checks
     add_compile_options("$<$<CONFIG:Debug>:/RTC1>")
     # Force Visual Studio to actualize __cplusplus version macro
@@ -188,6 +192,8 @@ endif()
 #--------------------------------------
 if(WIN32)
 
+    add_definitions(-DWIN_TARGET)
+
     if(MSVC)
         add_definitions(-D_CRT_SECURE_NO_WARNINGS)
     endif()
@@ -203,9 +209,13 @@ if(WIN32)
 
 elseif(IOS)
 
+    add_definitions(-DIOS_TARGET)
+
     list(APPEND SrcLib ${SrcIOS})
 
 elseif(APPLE)
+
+    add_definitions(-DMACOS_TARGET)
 
     if(USE_METAL_API)
         add_definitions(-DUSE_METAL_API)
@@ -220,10 +230,16 @@ elseif(APPLE)
 elseif(UNIX)
 
     if(USE_WAYLAND_API)
+        add_definitions(-DUNIX_TARGET -DUSE_WAYLAND_API)
+
         list(APPEND SrcLib ${SrcWayland})
     elseif(EMSCRIPTEN)
+        add_definitions(-DEMSCRIPTEN_TARGET)
+
         list(APPEND SrcLib ${SrcWeb})
     else()
+        add_definitions(-DUNIX_TARGET)
+
         if(USE_OPENGL_API)
             list(APPEND SrcLib ${SrcGL})
 
@@ -234,12 +250,30 @@ elseif(UNIX)
 
 endif()
 
+add_definitions(
+    -DMFB_VERSION_MAJOR=${PROJECT_VERSION_MAJOR}
+    -DMFB_VERSION_MINOR=${PROJECT_VERSION_MINOR}
+    -DMFB_VERSION_PATCH=${PROJECT_VERSION_PATCH}
+)
+
+# Versioning
+#--------------------------------------
+if(WIN32)
+
+    configure_file(${CMAKE_CURRENT_SOURCE_DIR}/version.rc.in
+        ${CMAKE_CURRENT_BINARY_DIR}/version.rc
+        @ONLY
+    )
+    list(APPEND SrcLib ${CMAKE_CURRENT_BINARY_DIR}/version.rc)
+
+endif()
+
 # Library
 #--------------------------------------
-add_library(minifb STATIC
+add_library(minifb SHARED
     ${SrcLib}
 )
-add_library(minifb::minifb ALIAS minifb)
+set_target_properties(minifb PROPERTIES VERSION ${PROJECT_VERSION} SOVERSION ${PROJECT_VERSION_MAJOR}.${PROJECT_VERSION_MINOR})
 
 # Link
 #--------------------------------------
@@ -320,88 +354,10 @@ target_include_directories(minifb PRIVATE src)
 
 link_libraries(minifb)
 
-# Examples
-#--------------------------------------
-if(MINIFB_BUILD_EXAMPLES)
-    if(NOT IOS)
-
-        add_executable(noise
-            tests/noise.c
-        )
-
-        add_executable(input_events
-            tests/input_events.c
-        )
-
-        add_executable(input_events_cpp
-            tests/input_events_cpp.cpp
-        )
-
-        add_executable(multiple_windows
-            tests/multiple_windows.c
-        )
-
-        add_executable(hidpi
-            tests/hidpi.c
-        )
-
-        add_executable(fullscreen
-            tests/fullscreen.c
-        )
-
-        add_executable(timer
-            tests/timer.c
-        )
-
-        if(EMSCRIPTEN)
-            add_custom_target(web_assets
-                COMMAND ${CMAKE_COMMAND} -E copy_directory
-                    ${CMAKE_CURRENT_SOURCE_DIR}/tests/web
-                    ${CMAKE_CURRENT_BINARY_DIR}
-            )
-            add_dependencies(noise web_assets)
-            target_link_options(noise PRIVATE "-sEXPORT_NAME=noise")
-            add_dependencies(input_events web_assets)
-            target_link_options(input_events PRIVATE "-sEXPORT_NAME=input_events")
-            add_dependencies(hidpi web_assets)
-            target_link_options(hidpi PRIVATE "-sEXPORT_NAME=hidpi")
-            add_dependencies(multiple_windows web_assets)
-            target_link_options(multiple_windows PRIVATE "-sEXPORT_NAME=multiple_windows")
-            add_dependencies(timer web_assets)
-            target_link_options(timer PRIVATE "-sEXPORT_NAME=timer")
-        endif()
-
-    else()
-
-        add_executable(noise
-            tests/ios/main.m
-            tests/ios/AppDelegate.h
-            tests/ios/AppDelegate.m
-        )
-
-        set(CMAKE_OSX_DEPLOYMENT_TARGET "11.0" CACHE STRING "Set CMake deployment target" ${FORCE_CACHE})
-
-        target_include_directories(noise PRIVATE src)
-        target_include_directories(noise PRIVATE src/ios)
-
-        add_definitions(-DTVOS_DEPLOYMENT_TARGET=${CMAKE_OSX_DEPLOYMENT_TARGET})
-
-    endif()
-
-endif()
-
 # Organize IDE Folders
 #--------------------------------------
 set_property(GLOBAL PROPERTY USE_FOLDERS ON)
 set_property(TARGET minifb PROPERTY FOLDER "Libs")
-
-if(MINIFB_BUILD_EXAMPLES)
-    set_property(TARGET noise PROPERTY FOLDER "Tests")
-    set_property(TARGET input_events PROPERTY FOLDER "Tests")
-    set_property(TARGET input_events_cpp PROPERTY FOLDER "Tests")
-    set_property(TARGET multiple_windows PROPERTY FOLDER "Tests")
-    set_property(TARGET hidpi PROPERTY FOLDER "Tests")
-endif()
 
 install(TARGETS minifb EXPORT minifb)
 file(GLOB_RECURSE HEADERS "${CMAKE_CURRENT_LIST_DIR}/include/*.h")

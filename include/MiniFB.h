@@ -1,6 +1,7 @@
 #ifndef _MINIFB_H_
 #define _MINIFB_H_
 
+#include "MiniFB_version.h"
 #include "MiniFB_enums.h"
 
 #ifdef __cplusplus
@@ -97,10 +98,6 @@ double              mfb_timer_get_resolution(void);
 
 #ifdef __cplusplus
 }
-
-#if !defined(MINIFB_AVOID_CPP_HEADERS)
-    #include "MiniFB_cpp.h"
-#endif
 
 #endif
 
