@@ -1,8 +1,8 @@
 #include <MiniFB_version.h>
 
-mfb_build_version_t const mfb_build_version = { MFB_VERSION_MAJOR, MFB_VERSION_MINOR, MFB_VERSION_PATCH, 0 };
+const mfb_build_version_t mfb_build_version = { MFB_VERSION_MAJOR, MFB_VERSION_MINOR, MFB_VERSION_PATCH, 0 };
 
-const char* const mfb_build_variant =
+const char mfb_build_variant[] =
 #if defined(__ANDROID__)
     "android"
 #elif defined(WIN_TARGET)

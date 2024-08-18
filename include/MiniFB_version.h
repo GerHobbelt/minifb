@@ -22,8 +22,8 @@ typedef struct {
     unsigned char major, minor, patch, _reserved;
 } mfb_build_version_t;
 
-extern mfb_build_version_t const mfb_build_version;
+extern const mfb_build_version_t mfb_build_version;
 
-extern const char* const mfb_build_variant;
+extern const char mfb_build_variant[];
 
 #endif
