@@ -273,7 +273,11 @@ endif()
 add_library(minifb SHARED
     ${SrcLib}
 )
-set_target_properties(minifb PROPERTIES VERSION ${PROJECT_VERSION} SOVERSION ${PROJECT_VERSION_MAJOR}.${PROJECT_VERSION_MINOR})
+set_target_properties(minifb PROPERTIES
+    VERSION ${PROJECT_VERSION}
+    SOVERSION ${PROJECT_VERSION_MAJOR}.${PROJECT_VERSION_MINOR}
+    OUTPUT_NAME "minifb$<IF:$<BOOL:${USE_METAL_API}>,-metal,$<$<BOOL:${USE_WAYLAND_API}>:-wayland>>"
+)
 
 # Link
 #--------------------------------------
