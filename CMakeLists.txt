@@ -68,6 +68,8 @@ set(SrcIOS
 
 #--
 set(SrcWayland
+    src/wayland/xdg-shell-protocol.h
+    src/wayland/xdg-shell-protocol.c
     src/wayland/WaylandMiniFB.c
     src/wayland/WindowData_Way.h
     src/MiniFB_linux.c

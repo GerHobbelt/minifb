@@ -6,6 +6,7 @@
 
 #include <wayland-client.h>
 #include <wayland-cursor.h>
+#include "xdg-shell-protocol.h"
 
 #include <inttypes.h>
 #include <limits.h>
@@ -58,8 +59,9 @@ destroy(SWindowData *window_data)
     } while (0);                                        \
     window_data_way->NAME = 0x0;
 
-    KILL(shell_surface);
-    KILL(shell);
+    if (window_data_way->xdg_toplevel) { xdg_toplevel_destroy(window_data_way->xdg_toplevel); }
+    if (window_data_way->xdg_surface) { xdg_surface_destroy(window_data_way->xdg_surface); }
+    if (window_data_way->xdg_wm_base) { xdg_wm_base_destroy(window_data_way->xdg_wm_base); }
     KILL(surface);
     //KILL(buffer);
     if(window_data->draw_buffer) {
@@ -494,17 +496,29 @@ wl_shm_listener shm_listener = {
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 static void
+handle_ping(void *data, struct xdg_wm_base *xdg_wm_base, uint32_t serial)
+{
+    kUnused(data);
+    xdg_wm_base_pong(xdg_wm_base, serial);
+}
+
+static const struct
+xdg_wm_base_listener xdg_wm_base_listener = {
+    .ping = handle_ping
+};
+
+static void
 registry_global(void *data, struct wl_registry *registry, uint32_t id, char const *iface, uint32_t version)
 {
     kUnused(version);
 
     SWindowData         *window_data     = (SWindowData *) data;
     SWindowData_Way   *window_data_way = (SWindowData_Way *) window_data->specific;
-    if (strcmp(iface, "wl_compositor") == 0)
+    if (strcmp(iface, wl_compositor_interface.name) == 0)
     {
         window_data_way->compositor = (struct wl_compositor *) wl_registry_bind(registry, id, &wl_compositor_interface, 1);
     }
-    else if (strcmp(iface, "wl_shm") == 0)
+    else if (strcmp(iface, wl_shm_interface.name) == 0)
     {
         window_data_way->shm = (struct wl_shm *) wl_registry_bind(registry, id, &wl_shm_interface, 1);
         if (window_data_way->shm) {
@@ -513,11 +527,15 @@ registry_global(void *data, struct wl_registry *registry, uint32_t id, char cons
             window_data_way->default_cursor = wl_cursor_theme_get_cursor(window_data_way->cursor_theme, "left_ptr");
         }
     }
-    else if (strcmp(iface, "wl_shell") == 0)
+    else if (strcmp(iface, xdg_wm_base_interface.name) == 0)
     {
-        window_data_way->shell = (struct wl_shell *) wl_registry_bind(registry, id, &wl_shell_interface, 1);
+        window_data_way->xdg_wm_base = (struct xdg_wm_base *) wl_registry_bind(registry, id, &xdg_wm_base_interface, 1);
+        if (window_data_way->xdg_wm_base)
+        {
+            xdg_wm_base_add_listener(window_data_way->xdg_wm_base, &xdg_wm_base_listener, window_data);
+        }
     }
-    else if (strcmp(iface, "wl_seat") == 0)
+    else if (strcmp(iface, wl_seat_interface.name) == 0)
     {
         window_data_way->seat = (struct wl_seat *) wl_registry_bind(registry, id, &wl_seat_interface, 1);
         if (window_data_way->seat)
@@ -534,33 +552,39 @@ wl_registry_listener registry_listener = {
 };
 
 static void
-handle_ping(void *data, struct wl_shell_surface *shell_surface, uint32_t serial)
+handle_surface_configure(void *data, struct xdg_surface *xdg_surface, uint32_t serial)
 {
     kUnused(data);
-    wl_shell_surface_pong(shell_surface, serial);
+
+    xdg_surface_ack_configure(xdg_surface, serial);
 }
 
+static const struct
+xdg_surface_listener xdg_surface_listener = {
+    .configure = handle_surface_configure
+};
+
 static void
-handle_configure(void *data, struct wl_shell_surface *shell_surface, uint32_t edges, int32_t width, int32_t height)
+handle_toplevel_configure(void* data, struct xdg_toplevel *xdg_toplevel, int32_t width, int32_t height, struct wl_array *states)
 {
     kUnused(data);
-    kUnused(shell_surface);
-    kUnused(edges);
+    kUnused(xdg_toplevel);
     kUnused(width);
     kUnused(height);
+    kUnused(states);
 }
 
 static void
-handle_popup_done(void *data, struct wl_shell_surface *shell_surface)
+handle_toplevel_close(void *data, struct xdg_toplevel *xdg_toplevel)
 {
     kUnused(data);
-    kUnused(shell_surface);
+    kUnused(xdg_toplevel);
 }
 
-static const struct wl_shell_surface_listener shell_surface_listener = {
-    handle_ping,
-    handle_configure,
-    handle_popup_done
+static const struct
+xdg_toplevel_listener xdg_toplevel_listener = {
+    .configure = handle_toplevel_configure,
+    .close = handle_toplevel_close
 };
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -645,15 +669,26 @@ mfb_open_ex(const char *title, unsigned width, unsigned height, unsigned flags)
     window_data_way->cursor_surface = wl_compositor_create_surface(window_data_way->compositor);
 
     // There should always be a shell, right?
-    if (window_data_way->shell)
+    // Answer: not on current shells, as most of them dropped support for the obsolete "wl_shell".
+    // Fix: Upgraded to use "xdg_shell" instead of "wl_shell".
+    // This leaves out very old shells, which do not implement a stable "xdg_shell" extension,
+    // but at least almost all current shells seem to implement it. It's also recommended to switch
+    // from "wl_shell" to "xdg_shell".
+    // This leaves a new question: There should always (at least on current shells) be a "xdg_wm_base", right?
+    if (window_data_way->xdg_wm_base)
     {
-        window_data_way->shell_surface = wl_shell_get_shell_surface(window_data_way->shell, window_data_way->surface);
-        if (!window_data_way->shell_surface)
+        window_data_way->xdg_surface = xdg_wm_base_get_xdg_surface(window_data_way->xdg_wm_base, window_data_way->surface);
+        if (!window_data_way->xdg_surface)
             goto out;
 
-        wl_shell_surface_set_title(window_data_way->shell_surface, title);
-        wl_shell_surface_add_listener(window_data_way->shell_surface, &shell_surface_listener, 0x0);
-        wl_shell_surface_set_toplevel(window_data_way->shell_surface);
+        xdg_surface_add_listener(window_data_way->xdg_surface, &xdg_surface_listener, window_data);
+
+        window_data_way->xdg_toplevel = xdg_surface_get_toplevel(window_data_way->xdg_surface);
+        if (!window_data_way->xdg_toplevel)
+            goto out;
+
+        xdg_toplevel_set_title(window_data_way->xdg_toplevel, title);
+        xdg_toplevel_add_listener(window_data_way->xdg_toplevel, &xdg_toplevel_listener, window_data);
     }
 
     wl_surface_attach(window_data_way->surface, (struct wl_buffer *) window_data->draw_buffer, window_data->dst_offset_x, window_data->dst_offset_y);

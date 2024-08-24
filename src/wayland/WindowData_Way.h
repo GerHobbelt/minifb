@@ -2,27 +2,15 @@
 
 #include <MiniFB_enums.h>
 #include <stdint.h>
-
-struct wl_display;
-struct wl_registry;
-struct wl_compositor;
-struct wl_shell;
-struct wl_seat;
-struct wl_keyboard;
-struct wl_pointer;
-struct wl_callback;
-struct wl_shm;
-struct wl_shm_pool;
-struct wl_surface;
-struct wl_shell_surface;
-struct wl_buffer;
+#include <wayland-client.h>
+#include "xdg-shell-protocol.h"
 
 typedef struct
 {
     struct wl_display       *display;
     struct wl_registry      *registry;
     struct wl_compositor    *compositor;
-    struct wl_shell         *shell;
+    struct xdg_wm_base      *xdg_wm_base;
     struct wl_seat          *seat;
     struct wl_keyboard      *keyboard;
     
@@ -34,7 +22,8 @@ typedef struct
     struct wl_shm           *shm;
     struct wl_shm_pool      *shm_pool;
     struct wl_surface       *surface;
-    struct wl_shell_surface *shell_surface;
+    struct xdg_surface      *xdg_surface;
+    struct xdg_toplevel     *xdg_toplevel;
 
     uint32_t                seat_version;
     uint32_t                shm_format;
