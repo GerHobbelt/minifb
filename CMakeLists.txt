@@ -142,7 +142,7 @@ if(NOT MSVC)
     # Set our flags
     #--------------------------------------
     add_compile_options("$<$<CONFIG:Debug>:-g>")
-    add_compile_options("$<IF:$<CONFIG:Debug>,-O0,-O3>")
+    add_compile_options("$<IF:$<CONFIG:Debug>,-O0,-O2>")
     add_compile_options(-Wall -Wextra)
     add_compile_options(-Wno-switch -Wno-unused-function -Wno-unused-parameter -Wno-implicit-fallthrough)
 
@@ -170,11 +170,7 @@ else()
     # Optimizations
     add_compile_options("$<IF:$<CONFIG:Debug>,/Od,/O2>")
     # Inline function expansion
-    if (MSVC_VERSION GREATER_EQUAL 1920)
-        add_compile_options("$<IF:$<CONFIG:Debug>,/Ob0,/Ob3>")
-    else()
-        add_compile_options("$<IF:$<CONFIG:Debug>,/Ob0,/Ob2>")
-    endif()
+    add_compile_options("$<IF:$<CONFIG:Debug>,/Ob0,/Ob2>")
     # Basic runtime checks
     add_compile_options("$<$<CONFIG:Debug>:/RTC1>")
     # Force Visual Studio to actualize __cplusplus version macro
