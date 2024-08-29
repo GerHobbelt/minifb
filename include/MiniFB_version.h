@@ -1,6 +1,8 @@
 #ifndef _MINIFB_VERSION_H_
 #define _MINIFB_VERSION_H_
 
+#include "MiniFB_export.h"
+
 // macro definition checks taken from here: https://stackoverflow.com/a/48685077
 
 #if !defined(MFB_VERSION_MAJOR) || (~(~MFB_VERSION_MAJOR + 0) == 0 && ~(~MFB_VERSION_MAJOR + 1) == 1)
@@ -22,8 +24,7 @@ typedef struct {
     unsigned char major, minor, patch, _reserved;
 } mfb_build_version_t;
 
-extern const mfb_build_version_t mfb_build_version;
-
-extern const char mfb_build_variant[];
+MFB_EXPORT extern const mfb_build_version_t mfb_build_version;
+MFB_EXPORT extern const char                mfb_build_variant[];
 
 #endif

@@ -342,6 +342,7 @@ elseif(WIN32)
     endif()
 
     target_link_libraries(minifb PRIVATE
+        "gdi32.lib"
         "winmm.lib"
     )
 
