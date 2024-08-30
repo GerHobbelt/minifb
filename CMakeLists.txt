@@ -176,6 +176,9 @@ else()
     # Force Visual Studio to actualize __cplusplus version macro
     add_compile_options(/Zc:__cplusplus)
 
+    # Disable incremental linking
+    add_link_options("/INCREMENTAL:NO")
+
 endif()
 
 if(CMAKE_BUILD_TYPE STREQUAL "Debug")
@@ -183,6 +186,14 @@ if(CMAKE_BUILD_TYPE STREQUAL "Debug")
     add_definitions(-DDEBUG)
     if(EMSCRIPTEN)
         add_link_options(-g)
+    endif()
+elseif(CMAKE_BUILD_TYPE STREQUAL "Release")
+    if(NOT MSVC)
+        # Strip
+        add_link_options(-s)
+    else()
+        # Remove unreferenced sections, merge identical sections
+        add_link_options("/OPT:REF /OPT:ICF")
     endif()
 endif()
 
