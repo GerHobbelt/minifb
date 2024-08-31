@@ -1,4 +1,5 @@
-#pragma once
+#ifndef _MINIFB_ENUMS_H_
+#define _MINIFB_ENUMS_H_
 
 #include <stdint.h>
 #include <stdbool.h>
@@ -184,3 +185,4 @@ typedef void(*mfb_mouse_button_func)(struct mfb_window *window, mfb_mouse_button
 typedef void(*mfb_mouse_move_func)(struct mfb_window *window, int x, int y);
 typedef void(*mfb_mouse_scroll_func)(struct mfb_window *window, mfb_key_mod mod, float deltaX, float deltaY);
 
+#endif

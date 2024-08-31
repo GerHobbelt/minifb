@@ -24,6 +24,7 @@ endif()
 #--------------------------------------
 set(SrcLib
     include/MiniFB.h
+    include/MiniFB_export.h
     include/MiniFB_version.h
     include/MiniFB_enums.h
 

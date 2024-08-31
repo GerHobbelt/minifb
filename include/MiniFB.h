@@ -10,6 +10,7 @@ extern "C" {
 #endif
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
 #ifndef __ANDROID__
 #define MFB_RGB(r, g, b)        (((uint32_t) r) << 16) | (((uint32_t) g) << 8) | ((uint32_t) b)
 #define MFB_ARGB(a, r, g, b)    (((uint32_t) a) << 24) | (((uint32_t) r) << 16) | (((uint32_t) g) << 8) | ((uint32_t) b)
@@ -99,7 +100,6 @@ MFB_EXPORT double              mfb_timer_get_resolution(void);
 
 #ifdef __cplusplus
 }
-
 #endif
 
 #endif
