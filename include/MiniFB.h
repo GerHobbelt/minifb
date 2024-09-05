@@ -53,7 +53,7 @@ MFB_EXPORT bool                mfb_set_viewport(struct mfb_window *window, unsig
 // Let mfb to calculate the best fit from your framebuffer original size
 MFB_EXPORT bool                mfb_set_viewport_best_fit(struct mfb_window *window, unsigned old_width, unsigned old_height);
 
-#if defined(WIN32) || (defined(UNIX) && !(defined(APPLE) || defined(EMSCRIPTEN)))
+#if defined(_WIN32) || defined(__linux__)
 
 // Set/get window title
 MFB_EXPORT void                mfb_set_title(struct mfb_window *window, const char *title);

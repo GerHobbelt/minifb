@@ -10,6 +10,7 @@
 //#include <X11/extensions/Xrandr.h>
 #include <xkbcommon/xkbcommon.h>
 
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -145,7 +146,7 @@ mfb_open_ex(const char *title, unsigned width, unsigned height, unsigned flags) 
     );
 
     //XStoreName(window_data_x11->display, window_data_x11->window, title);
-    mfb_set_title(window_data_x11->window, title);
+    mfb_set_title((struct mfb_window *) window_data, title);
 
     if (flags & WF_BORDERLESS) {
         struct StyleHints {
@@ -923,7 +924,11 @@ void mfb_set_title(struct mfb_window *window, const char *title)
         return;
     }
 
-    window_data_x11 = (SWindowData_X11 *) window->specific;
+    if (title == 0x0) {
+        return;
+    }
+
+    window_data_x11 = (SWindowData_X11 *) window_data->specific;
 
     unsigned char *title_unsigned = (unsigned char *)title;
     int            title_len      = strlen(title); 
@@ -958,7 +963,7 @@ char *mfb_get_title(struct mfb_window *window, mfb_get_title_buffer_func callbac
         return NULL;
     }
 
-    window_data_x11 = (SWindowData_X11 *) window->specific;
+    window_data_x11 = (SWindowData_X11 *) window_data->specific;
 
     Atom type;
     int  format;
@@ -989,8 +994,8 @@ char *mfb_get_title(struct mfb_window *window, mfb_get_title_buffer_func callbac
 
     // prop should be non-null here
 
-    unsigned int  length       = (unsigned int)nitems + 1;
-    char         *title_buffer = callback(window, length, data);
+    length       = (unsigned int)nitems + 1;
+    title_buffer = callback(window, length, data);
 
     if (title_buffer != 0x0) {
         strncpy(title_buffer, (const char*)prop, length);

@@ -999,7 +999,7 @@ void mfb_set_title(struct mfb_window *window, const char *title)
         return;
     }
 
-    if (title == NULL) {
+    if (title == 0x0) {
         return;
     }
 
