@@ -990,6 +990,63 @@ mfb_set_viewport(struct mfb_window *window, unsigned offset_x, unsigned offset_y
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
+void mfb_set_title(struct mfb_window *window, const char *title)
+{
+    SWindowData     *window_data     = (SWindowData *)window;
+    SWindowData_Win *window_data_win = 0x0;
+
+    if (window_data == 0x0) {
+        return;
+    }
+
+    if (title == NULL) {
+        return;
+    }
+
+    window_data_win = (SWindowData_Win *) window_data->specific;
+
+    SendMessage(window_data_win->window, WM_SETTEXT, 0, (LPARAM)title);
+}
+
+char *mfb_get_title(struct mfb_window *window, mfb_get_title_buffer_func callback, void *data)
+{
+    SWindowData     *window_data     = (SWindowData *)window;
+    SWindowData_Win *window_data_win = 0x0;
+
+    if (window_data == 0x0) {
+        return NULL;
+    }
+
+    if (callback == 0x0) {
+        return NULL;
+    }
+
+    window_data_win = (SWindowData_Win *) window_data->specific;
+
+    LRESULT get_text_length_result = SendMessage(window_data_win->window, WM_GETTEXTLENGTH, 0, 0);
+
+    if (get_text_length_result < 0) {
+        return NULL;
+    }
+
+    unsigned int  length       = (unsigned int)get_text_length_result + 1;
+    char         *title_buffer = callback(window, length, data);
+
+    if (title_buffer == 0x0) {
+        return NULL;
+    }
+
+    LRESULT get_text_result = SendMessage(window_data_win->window, WM_GETTEXT, length, (LPARAM)title_buffer);
+
+    if (get_text_result < 0) {
+        return NULL;
+    }
+
+    return title_buffer;
+}
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
 extern double   g_timer_frequency;
 extern double   g_timer_resolution;
 

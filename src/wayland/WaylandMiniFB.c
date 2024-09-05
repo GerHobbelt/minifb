@@ -1063,3 +1063,22 @@ mfb_get_monitor_scale(struct mfb_window *window, float *scale_x, float *scale_y)
         }
     }
 }
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// TODO: implement stub
+void mfb_set_title(struct mfb_window *window, const char *title)
+{
+    kUnused(window);
+    kUnused(title);
+}
+
+// TODO: implement stub
+char *mfb_get_title(struct mfb_window *window, mfb_get_title_buffer_func callback, void *data)
+{
+    kUnused(window);
+    kUnused(callback);
+    kUnused(data);
+
+    return NULL;
+}

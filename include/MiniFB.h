@@ -53,6 +53,14 @@ MFB_EXPORT bool                mfb_set_viewport(struct mfb_window *window, unsig
 // Let mfb to calculate the best fit from your framebuffer original size
 MFB_EXPORT bool                mfb_set_viewport_best_fit(struct mfb_window *window, unsigned old_width, unsigned old_height);
 
+#if defined(WIN32) || (defined(UNIX) && !(defined(APPLE) || defined(EMSCRIPTEN)))
+
+// Set/get window title
+MFB_EXPORT void                mfb_set_title(struct mfb_window *window, const char *title);
+MFB_EXPORT char *              mfb_get_title(struct mfb_window *window, mfb_get_title_buffer_func callback, void *data);
+
+#endif
+
 // DPI
 // [Deprecated]: Probably a better name will be mfb_get_monitor_scale
 MFB_EXPORT void                mfb_get_monitor_dpi(struct mfb_window *window, float *dpi_x, float *dpi_y);

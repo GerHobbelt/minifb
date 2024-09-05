@@ -185,4 +185,11 @@ typedef void(*mfb_mouse_button_func)(struct mfb_window *window, mfb_mouse_button
 typedef void(*mfb_mouse_move_func)(struct mfb_window *window, int x, int y);
 typedef void(*mfb_mouse_scroll_func)(struct mfb_window *window, mfb_key_mod mod, float deltaX, float deltaY);
 
+#if defined(WIN32) || (defined(UNIX) && !(defined(APPLE) || defined(EMSCRIPTEN)))
+
+// mfb_get_title callback
+typedef char *(*mfb_get_title_buffer_func)(struct mfb_window *window, unsigned int length, void* data);
+
+#endif
+
 #endif

@@ -144,7 +144,8 @@ mfb_open_ex(const char *title, unsigned width, unsigned height, unsigned flags) 
         | EnterWindowMask | LeaveWindowMask
     );
 
-    XStoreName(window_data_x11->display, window_data_x11->window, title);
+    //XStoreName(window_data_x11->display, window_data_x11->window, title);
+    mfb_set_title(window_data_x11->window, title);
 
     if (flags & WF_BORDERLESS) {
         struct StyleHints {
@@ -909,4 +910,93 @@ mfb_get_monitor_scale(struct mfb_window *window, float *scale_x, float *scale_y)
             *scale_y = 1.0f;
         }
     }
+}
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+void mfb_set_title(struct mfb_window *window, const char *title)
+{
+    SWindowData     *window_data     = (SWindowData *)window;
+    SWindowData_X11 *window_data_x11 = 0x0;
+
+    if (window_data == 0x0) {
+        return;
+    }
+
+    window_data_x11 = (SWindowData_X11 *) window->specific;
+
+    unsigned char *title_unsigned = (unsigned char *)title;
+    int            title_len      = strlen(title); 
+
+    // set the UTF-8 window name
+    XChangeProperty(window_data_x11->display, window_data_x11->window,
+        XInternAtom(window_data_x11->display, "_NET_WM_NAME", False),
+        XInternAtom(window_data_x11->display, "UTF8_STRING", False),
+        8, PropModeReplace,
+        title_unsigned, title_len
+    );
+
+    // set the legacy window name
+    XChangeProperty(window_data_x11->display, window_data_x11->window,
+        XInternAtom(window_data_x11->display, "WM_NAME", False),
+        XInternAtom(window_data_x11->display, "STRING", False),
+        8, PropModeReplace,
+        title_unsigned, title_len
+    );
+}
+
+char *mfb_get_title(struct mfb_window *window, mfb_get_title_buffer_func callback, void *data)
+{
+    SWindowData     *window_data     = (SWindowData *)window;
+    SWindowData_X11 *window_data_x11 = 0x0;
+
+    if (window_data == 0x0) {
+        return NULL;
+    }
+
+    if (callback == 0x0) {
+        return NULL;
+    }
+
+    window_data_x11 = (SWindowData_X11 *) window->specific;
+
+    Atom type;
+    int  format;
+    unsigned long  nitems, bytes_after;
+    unsigned char *prop = 0x0;
+    unsigned int   length;
+    char          *title_buffer;
+
+    // try getting the UTF-8 window name
+    if ((XGetWindowProperty(window_data_x11->display, window_data_x11->window,
+        XInternAtom(window_data_x11->display, "_NET_WM_NAME", False),
+        0, LONG_MAX, False,
+        XInternAtom(window_data_x11->display, "UTF8_STRING", False),
+        &type, &format, &nitems, &bytes_after, &prop
+    ) != Success) || (prop == 0x0))
+    {
+        // if that fails, try again, this time getting the legacy window name
+        if ((XGetWindowProperty(window_data_x11->display, window_data_x11->window,
+            XInternAtom(window_data_x11->display, "WM_NAME", False),
+            0, LONG_MAX, False,
+            XInternAtom(window_data_x11->display, "STRING", False),
+            &type, &format, &nitems, &bytes_after, &prop
+        ) != Success) || (prop == 0x0))
+        {
+            return NULL;
+        }
+    }
+
+    // prop should be non-null here
+
+    unsigned int  length       = (unsigned int)nitems + 1;
+    char         *title_buffer = callback(window, length, data);
+
+    if (title_buffer != 0x0) {
+        strncpy(title_buffer, (const char*)prop, length);
+    }
+
+    XFree(prop);
+
+    return title_buffer;
 }
