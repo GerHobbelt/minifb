@@ -7,6 +7,9 @@
 #endif
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>
+#include <stdbool.h>
+#include <limits.h>
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 // Copied (and modified) from Windows Kit 10 to avoid setting _WIN32_WINNT to a higher version
@@ -1010,8 +1013,12 @@ void mfb_set_title(struct mfb_window *window, const char *title)
 
 char *mfb_get_title(struct mfb_window *window, mfb_get_title_buffer_func callback, void *data)
 {
-    SWindowData     *window_data     = (SWindowData *)window;
-    SWindowData_Win *window_data_win = 0x0;
+    SWindowData     *window_data            = (SWindowData *)window;
+    SWindowData_Win *window_data_win        = 0x0;
+    LRESULT          get_text_length_result;
+    uint32_t         length;
+    char            *title_buffer;
+    LRESULT          get_text_result;
 
     if (window_data == 0x0) {
         return NULL;
@@ -1023,20 +1030,22 @@ char *mfb_get_title(struct mfb_window *window, mfb_get_title_buffer_func callbac
 
     window_data_win = (SWindowData_Win *) window_data->specific;
 
-    LRESULT get_text_length_result = SendMessage(window_data_win->window, WM_GETTEXTLENGTH, 0, 0);
+    get_text_length_result = SendMessage(window_data_win->window, WM_GETTEXTLENGTH, 0, 0);
 
     if (get_text_length_result < 0) {
         return NULL;
     }
 
-    unsigned int  length       = (unsigned int)get_text_length_result + 1;
-    char         *title_buffer = callback(window, length, data);
+    length       = get_text_length_result < (UINT32_MAX - 1)
+                    ? (uint32_t)get_text_length_result + 1
+                    : UINT32_MAX;
+    title_buffer = callback(length, data);
 
     if (title_buffer == 0x0) {
         return NULL;
     }
 
-    LRESULT get_text_result = SendMessage(window_data_win->window, WM_GETTEXT, length, (LPARAM)title_buffer);
+    get_text_result = SendMessage(window_data_win->window, WM_GETTEXT, length, (LPARAM)title_buffer);
 
     if (get_text_result < 0) {
         return NULL;

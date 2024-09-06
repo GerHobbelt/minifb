@@ -10,9 +10,11 @@
 //#include <X11/extensions/Xrandr.h>
 #include <xkbcommon/xkbcommon.h>
 
-#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>
+#include <stdbool.h>
+#include <limits.h>
 #include <string.h>
 #include <unistd.h>
 #include <MiniFB.h>
@@ -954,6 +956,13 @@ char *mfb_get_title(struct mfb_window *window, mfb_get_title_buffer_func callbac
 {
     SWindowData     *window_data     = (SWindowData *)window;
     SWindowData_X11 *window_data_x11 = 0x0;
+    Atom             type;
+    int              format;
+    unsigned long    nitems;
+    unsigned long    bytes_after;
+    unsigned char   *prop = 0x0;
+    uint32_t         length;
+    char            *title_buffer;
 
     if (window_data == 0x0) {
         return NULL;
@@ -965,13 +974,6 @@ char *mfb_get_title(struct mfb_window *window, mfb_get_title_buffer_func callbac
 
     window_data_x11 = (SWindowData_X11 *) window_data->specific;
 
-    Atom type;
-    int  format;
-    unsigned long  nitems, bytes_after;
-    unsigned char *prop = 0x0;
-    unsigned int   length;
-    char          *title_buffer;
-
     // try getting the UTF-8 window name
     if ((XGetWindowProperty(window_data_x11->display, window_data_x11->window,
         XInternAtom(window_data_x11->display, "_NET_WM_NAME", False),
@@ -980,6 +982,7 @@ char *mfb_get_title(struct mfb_window *window, mfb_get_title_buffer_func callbac
         &type, &format, &nitems, &bytes_after, &prop
     ) != Success) || (prop == 0x0))
     {
+
         // if that fails, try again, this time getting the legacy window name
         if ((XGetWindowProperty(window_data_x11->display, window_data_x11->window,
             XInternAtom(window_data_x11->display, "WM_NAME", False),
@@ -994,8 +997,10 @@ char *mfb_get_title(struct mfb_window *window, mfb_get_title_buffer_func callbac
 
     // prop should be non-null here
 
-    length       = (unsigned int)nitems + 1;
-    title_buffer = callback(window, length, data);
+    length       = nitems < (UINT32_MAX - 1)
+                    ? (uint32_t)nitems + 1
+                    : UINT32_MAX;
+    title_buffer = callback(length, data);
 
     if (title_buffer != 0x0) {
         strncpy(title_buffer, (const char*)prop, length);
