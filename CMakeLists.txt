@@ -121,6 +121,12 @@ endif()
 
 # Set GCC/Clang flags
 #--------------------------------------
+
+# Of course we have to enforce this also on Windows when using MSVC,
+# since our managed library and our native library would be both named "minifb.dll" instead
+set(CMAKE_SHARED_LIBRARY_PREFIX "lib")
+set(CMAKE_STATIC_LIBRARY_PREFIX "lib")
+
 if(NOT MSVC)
     # Avoid default flag values
     #--------------------------------------
