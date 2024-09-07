@@ -16,7 +16,10 @@ typedef struct mfb_timer {
 #if defined(__cplusplus)
 extern "C" {
 #endif
-    MFB_EXPORT extern short int g_keycodes[512];
+
+    extern short int g_keycodes[512];
+    MFB_EXPORT extern bool g_use_hardware_sync;
+
     void keyboard_default(struct mfb_window *window, mfb_key key, mfb_key_mod mod, bool isPressed);
 
     void calc_dst_factor(SWindowData *window_data, uint32_t width, uint32_t height);

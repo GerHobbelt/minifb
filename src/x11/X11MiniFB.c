@@ -961,7 +961,7 @@ char *mfb_get_title(struct mfb_window *window, mfb_get_title_buffer_func callbac
     unsigned long    nitems;
     unsigned long    bytes_after;
     unsigned char   *prop = 0x0;
-    uint32_t         length;
+    int32_t          length;
     char            *title_buffer;
 
     if (window_data == 0x0) {
@@ -997,12 +997,12 @@ char *mfb_get_title(struct mfb_window *window, mfb_get_title_buffer_func callbac
 
     // prop should be non-null here
 
-    length       = nitems < (UINT32_MAX - 1)
-                    ? (uint32_t)nitems + 1
-                    : UINT32_MAX;
-    title_buffer = callback(length, data);
+    length       = nitems < (INT32_MAX - 1)
+                    ? (int32_t)nitems + 1
+                    : INT32_MAX;
+    title_buffer = callback(&length, data);
 
-    if (title_buffer != 0x0) {
+    if ((title_buffer != 0x0) && (length >= 0)) {
         strncpy(title_buffer, (const char*)prop, length);
     }
 

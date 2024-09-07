@@ -188,7 +188,7 @@ typedef void(*mfb_mouse_scroll_func)(struct mfb_window *window, mfb_key_mod mod,
 #if defined(_WIN32) || defined(__linux__)
 
 // mfb_get_title callback
-typedef char *(*mfb_get_title_buffer_func)(uint32_t length, void* data);
+typedef char *(*mfb_get_title_buffer_func)(int32_t* length, void* data);
 
 #endif
 
