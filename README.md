@@ -116,7 +116,7 @@ $ cmake --build build/arm --config Release
 - A GCC toolchain
   - plus GCC toolchain for your target architecture, if you want to cross compile
 - Development versions of the library dependencies
-  - for the X11 variant this should only really be libX11 and libGL
+  - for the X11 variant this should only really be libx11, libgl and libxkbcommon
   - plus those development libraries for your target architecture, if you want to cross compile
 
 #### Setup
