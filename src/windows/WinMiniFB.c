@@ -617,6 +617,52 @@ mfb_open_ex(const char *title, unsigned width, unsigned height, unsigned flags) 
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
+static bool try_load_icon_from_buffer(SWindowData_Win *window_data_win, void *icon_buffer, unsigned icon_width, unsigned icon_height) {
+    ICONINFO iconInfo = { TRUE, 0, 0, NULL, NULL };
+
+    iconInfo.hbmColor = CreateBitmap(icon_width, icon_height, 1, 32, icon_buffer);
+    if (iconInfo.hbmColor) {
+        iconInfo.hbmMask = CreateCompatibleBitmap(window_data_win->hdc, icon_width, icon_height);
+
+        if (iconInfo.hbmMask) {
+            window_data_win->hIcon = CreateIconIndirect(&iconInfo);
+
+            if (window_data_win->hIcon) {
+                return true;
+            }
+
+            DeleteObject(iconInfo.hbmMask);
+        }
+
+        DeleteObject(iconInfo.hbmColor);
+    }
+
+    window_data_win->hIcon = NULL;
+
+    return false;
+}
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+struct mfb_window *
+mfb_open_ex_with_icon(const char *title, unsigned width, unsigned height, unsigned flags, void *icon_buffer, unsigned icon_width, unsigned icon_height) {
+    struct mfb_window *window           = mfb_open_ex(title, width, height, flags);
+    SWindowData_Win   *window_data_win;
+
+    if (window != 0x0 && icon_buffer != 0x0) {
+        window_data_win = (SWindowData_Win *) ((SWindowData *) window)->specific;
+
+        if (try_load_icon_from_buffer(window_data_win, icon_buffer, icon_width, icon_height)) {
+            SendMessage(window_data_win->window, WM_SETICON, ICON_SMALL, (LPARAM)window_data_win->hIcon);
+            SendMessage(window_data_win->window, WM_SETICON, ICON_BIG, (LPARAM)window_data_win->hIcon);
+        }
+    }
+
+    return window;
+}
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
 mfb_update_state
 mfb_update_ex(struct mfb_window *window, void *buffer, unsigned width, unsigned height) {
     MSG msg;
@@ -758,6 +804,10 @@ destroy_window_data(SWindowData *window_data) {
 #else
     destroy_GL_context(window_data);
 #endif
+
+    if (window_data_win->hIcon != 0x0) {
+        DestroyIcon(window_data_win->hIcon);
+    }
 
     if (window_data_win->window != 0 && window_data_win->hdc != 0) {
         ReleaseDC(window_data_win->window, window_data_win->hdc);

@@ -14,6 +14,7 @@ typedef struct {
 #else
     BITMAPINFO          *bitmapInfo;
 #endif
+    HICON               hIcon;
     struct mfb_timer    *timer;
     bool                mouse_inside;
 } SWindowData_Win;

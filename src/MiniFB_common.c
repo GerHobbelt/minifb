@@ -12,6 +12,16 @@ mfb_open(const char *title, unsigned width, unsigned height) {
     return mfb_open_ex(title, width, height, 0);
 }
 
+#if defined(_WIN32)
+
+//-------------------------------------
+struct mfb_window *
+mfb_open_with_icon(const char *title, unsigned width, unsigned height, void *icon_buffer, unsigned icon_width, unsigned icon_height) {
+    return mfb_open_ex_with_icon(title, width, height, 0, icon_buffer, icon_width, icon_height);
+}
+
+#endif
+
 //-------------------------------------
 mfb_update_state
 mfb_update(struct mfb_window *window, void *buffer) {

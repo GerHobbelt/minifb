@@ -30,6 +30,13 @@ extern "C" {
 MFB_EXPORT struct mfb_window * mfb_open(const char *title, unsigned width, unsigned height);
 MFB_EXPORT struct mfb_window * mfb_open_ex(const char *title, unsigned width, unsigned height, unsigned flags);
 
+#if defined(_WIN32)
+
+MFB_EXPORT struct mfb_window * mfb_open_with_icon(const char *title, unsigned width, unsigned height, void *icon_buffer, unsigned icon_width, unsigned icon_height);
+MFB_EXPORT struct mfb_window * mfb_open_ex_with_icon(const char *title, unsigned width, unsigned height, unsigned flags, void *icon_buffer, unsigned icon_width, unsigned icon_height);
+
+#endif
+
 // Update the display
 // Input buffer is assumed to be a 32-bit buffer of the size given in the open call
 // Will return a negative status if something went wrong or the user want to exit
