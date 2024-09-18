@@ -13,7 +13,7 @@
 #include "WindowData_OSX.h"
 #include <MiniFB.h>
 #include <MiniFB_internal.h>
-#include <MiniFB_enums.h>
+#include <MiniFB_types.h>
 
 //-------------------------------------
 void init_keycodes();
@@ -221,7 +221,7 @@ update_events(SWindowData *window_data) {
 
 //-------------------------------------
 mfb_update_state
-mfb_update_ex(struct mfb_window *window, void *buffer, unsigned width, unsigned height) {
+mfb_update_ex(struct mfb_window *window, const mfb_image *image) {
     if(window == 0x0) {
         return STATE_INVALID_WINDOW;
     }
@@ -232,31 +232,31 @@ mfb_update_ex(struct mfb_window *window, void *buffer, unsigned width, unsigned 
         return STATE_EXIT;
     }
 
-    if(buffer == 0x0) {
+    if(image == 0x0 || image->buffer == 0x0) {
         return STATE_INVALID_BUFFER;
     }
 
     SWindowData_OSX *window_data_osx = (SWindowData_OSX *) window_data->specific;
 
 #if defined(USE_METAL_API)
-    if(window_data->buffer_width != width || window_data->buffer_height != height) {
-        window_data->buffer_width  = width;
-        window_data->buffer_stride = width * 4;
-        window_data->buffer_height = height;
+    if(window_data->buffer_width != image->width || window_data->buffer_height != image->height) {
+        window_data->buffer_width  = image->width;
+        window_data->buffer_stride = image->width * 4;
+        window_data->buffer_height = image->height;
         window_data->draw_buffer   = realloc(window_data->draw_buffer, window_data->buffer_stride * window_data->buffer_height);
 
         [window_data_osx->viewController resizeTextures];
     }
 
-    memcpy(window_data->draw_buffer, buffer, window_data->buffer_stride * window_data->buffer_height);
+    memcpy(window_data->draw_buffer, image->buffer, window_data->buffer_stride * window_data->buffer_height);
 #else
-    if(window_data->buffer_width != width || window_data->buffer_height != height) {
-        window_data->buffer_width  = width;
-        window_data->buffer_stride = width * 4;
-        window_data->buffer_height = height;
+    if(window_data->buffer_width != image->width || window_data->buffer_height != image->height) {
+        window_data->buffer_width  = image->width;
+        window_data->buffer_stride = image->width * 4;
+        window_data->buffer_height = image->height;
     }
 
-    window_data->draw_buffer = buffer;
+    window_data->draw_buffer = image->buffer;
 #endif
 
     update_events(window_data);

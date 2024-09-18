@@ -1,6 +1,6 @@
 #pragma once
 
-#include <MiniFB_enums.h>
+#include <MiniFB_types.h>
 #include <WindowData.h>
 
 #if defined(USE_METAL_API)

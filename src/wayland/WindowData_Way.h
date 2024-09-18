@@ -1,6 +1,6 @@
 #pragma once
 
-#include <MiniFB_enums.h>
+#include <MiniFB_types.h>
 #include <stdint.h>
 #include <wayland-client.h>
 #include "xdg-shell-protocol.h"

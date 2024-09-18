@@ -513,8 +513,9 @@ EM_JS(mfb_update_state, mfb_update_js, (struct mfb_window * windowData, void *bu
     return Module._window_data_get_close(windowData);
 });
 
-mfb_update_state mfb_update_ex(struct mfb_window *window, void *buffer, unsigned width, unsigned height) {
-    mfb_update_state state = mfb_update_js(window, buffer, width, height);
+mfb_update_state mfb_update_ex(struct mfb_window *window, const mfb_image *image) {
+    if (image == 0x0) return STATE_INVALID_BUFFER;
+    mfb_update_state state = mfb_update_js(window, image->buffer, image->width, image->height);
     if (state != STATE_OK) return state;
     state = mfb_update_events_js((SWindowData *)window);
     return state;

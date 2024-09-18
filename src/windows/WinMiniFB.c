@@ -617,19 +617,17 @@ mfb_open_ex(const char *title, unsigned width, unsigned height, unsigned flags) 
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
-static bool try_load_icon_from_buffer(SWindowData_Win *window_data_win, void *icon_buffer, unsigned icon_width, unsigned icon_height) {
+static HICON
+load_icon_from_buffer(SWindowData_Win *window_data_win, void *buffer, unsigned width, unsigned height) {
+    HICON    hIcon    = NULL;
     ICONINFO iconInfo = { TRUE, 0, 0, NULL, NULL };
 
-    iconInfo.hbmColor = CreateBitmap(icon_width, icon_height, 1, 32, icon_buffer);
+    iconInfo.hbmColor = CreateBitmap(width, height, 1, 32, buffer);
     if (iconInfo.hbmColor) {
-        iconInfo.hbmMask = CreateCompatibleBitmap(window_data_win->hdc, icon_width, icon_height);
+        iconInfo.hbmMask = CreateCompatibleBitmap(window_data_win->hdc, width, height);
 
         if (iconInfo.hbmMask) {
-            window_data_win->hIcon = CreateIconIndirect(&iconInfo);
-
-            if (window_data_win->hIcon) {
-                return true;
-            }
+            hIcon = CreateIconIndirect(&iconInfo);
 
             DeleteObject(iconInfo.hbmMask);
         }
@@ -637,24 +635,33 @@ static bool try_load_icon_from_buffer(SWindowData_Win *window_data_win, void *ic
         DeleteObject(iconInfo.hbmColor);
     }
 
-    window_data_win->hIcon = NULL;
-
-    return false;
+    return hIcon;
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 struct mfb_window *
-mfb_open_ex_with_icon(const char *title, unsigned width, unsigned height, unsigned flags, void *icon_buffer, unsigned icon_width, unsigned icon_height) {
+mfb_open_ex_with_icons(const char *title, unsigned width, unsigned height, unsigned flags, const mfb_image *icon_small, const mfb_image *icon_big) {
     struct mfb_window *window           = mfb_open_ex(title, width, height, flags);
     SWindowData_Win   *window_data_win;
 
-    if (window != 0x0 && icon_buffer != 0x0) {
+    if (window != 0x0) {
         window_data_win = (SWindowData_Win *) ((SWindowData *) window)->specific;
 
-        if (try_load_icon_from_buffer(window_data_win, icon_buffer, icon_width, icon_height)) {
-            SendMessage(window_data_win->window, WM_SETICON, ICON_SMALL, (LPARAM)window_data_win->hIcon);
-            SendMessage(window_data_win->window, WM_SETICON, ICON_BIG, (LPARAM)window_data_win->hIcon);
+        if (icon_small != 0x0 && icon_small->buffer != 0x0) {
+            window_data_win->hIconSmall = load_icon_from_buffer(window_data_win, icon_small->buffer, icon_small->width, icon_small->height);
+
+            if (window_data_win->hIconSmall != NULL) {
+                SendMessage(window_data_win->window, WM_SETICON, ICON_SMALL, (LPARAM)window_data_win->hIconSmall);
+            }
+        }
+
+        if (icon_big != 0x0 && icon_big->buffer != 0x0) {
+            window_data_win->hIconBig = load_icon_from_buffer(window_data_win, icon_big->buffer, icon_big->width, icon_big->height);
+
+            if (window_data_win->hIconBig != NULL) {
+                SendMessage(window_data_win->window, WM_SETICON, ICON_BIG, (LPARAM)window_data_win->hIconBig);
+            }
         }
     }
 
@@ -664,7 +671,7 @@ mfb_open_ex_with_icon(const char *title, unsigned width, unsigned height, unsign
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 mfb_update_state
-mfb_update_ex(struct mfb_window *window, void *buffer, unsigned width, unsigned height) {
+mfb_update_ex(struct mfb_window *window, const mfb_image *image) {
     MSG msg;
 
     if (window == 0x0) {
@@ -677,14 +684,14 @@ mfb_update_ex(struct mfb_window *window, void *buffer, unsigned width, unsigned 
         return STATE_EXIT;
     }
 
-    if (buffer == 0x0) {
+    if (image == 0x0 || image->buffer == 0x0) {
         return STATE_INVALID_BUFFER;
     }
 
-    window_data->draw_buffer   = buffer;
-    window_data->buffer_width  = width;
-    window_data->buffer_stride = width * 4;
-    window_data->buffer_height = height;
+    window_data->draw_buffer   = image->buffer;
+    window_data->buffer_width  = image->width;
+    window_data->buffer_stride = image->width * 4;
+    window_data->buffer_height = image->height;
 
     SWindowData_Win *window_data_win = (SWindowData_Win *) window_data->specific;
 
@@ -697,7 +704,7 @@ mfb_update_ex(struct mfb_window *window, void *buffer, unsigned width, unsigned 
 
 #else
 
-    redraw_GL(window_data, buffer);
+    redraw_GL(window_data, image->buffer);
 
 #endif
 
@@ -805,8 +812,12 @@ destroy_window_data(SWindowData *window_data) {
     destroy_GL_context(window_data);
 #endif
 
-    if (window_data_win->hIcon != 0x0) {
-        DestroyIcon(window_data_win->hIcon);
+    if (window_data_win->hIconSmall != NULL) {
+        DestroyIcon(window_data_win->hIconSmall);
+    }
+
+    if (window_data_win->hIconBig != NULL) {
+        DestroyIcon(window_data_win->hIconBig);
     }
 
     if (window_data_win->window != 0 && window_data_win->hdc != 0) {

@@ -3,7 +3,7 @@
 
 #include "MiniFB_export.h"
 #include "MiniFB_version.h"
-#include "MiniFB_enums.h"
+#include "MiniFB_types.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -30,10 +30,10 @@ extern "C" {
 MFB_EXPORT struct mfb_window * mfb_open(const char *title, unsigned width, unsigned height);
 MFB_EXPORT struct mfb_window * mfb_open_ex(const char *title, unsigned width, unsigned height, unsigned flags);
 
-#if defined(_WIN32)
+#if defined(_WIN32) || defined(__linux__)
 
-MFB_EXPORT struct mfb_window * mfb_open_with_icon(const char *title, unsigned width, unsigned height, void *icon_buffer, unsigned icon_width, unsigned icon_height);
-MFB_EXPORT struct mfb_window * mfb_open_ex_with_icon(const char *title, unsigned width, unsigned height, unsigned flags, void *icon_buffer, unsigned icon_width, unsigned icon_height);
+MFB_EXPORT struct mfb_window * mfb_open_with_icons(const char *title, unsigned width, unsigned height, const mfb_image *icon_small, const mfb_image *icon_big);
+MFB_EXPORT struct mfb_window * mfb_open_ex_with_icons(const char *title, unsigned width, unsigned height, unsigned flags, const mfb_image *icon_small, const mfb_image *icon_big);
 
 #endif
 
@@ -43,7 +43,7 @@ MFB_EXPORT struct mfb_window * mfb_open_ex_with_icon(const char *title, unsigned
 // Also updates the window events
 MFB_EXPORT mfb_update_state    mfb_update(struct mfb_window *window, void *buffer);
 
-MFB_EXPORT mfb_update_state    mfb_update_ex(struct mfb_window *window, void *buffer, unsigned width, unsigned height);
+MFB_EXPORT mfb_update_state    mfb_update_ex(struct mfb_window *window, const mfb_image *image);
 
 // Only updates the window events
 MFB_EXPORT mfb_update_state    mfb_update_events(struct mfb_window *window);

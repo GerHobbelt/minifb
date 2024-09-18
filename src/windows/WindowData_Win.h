@@ -1,6 +1,6 @@
 #pragma once
 
-#include <MiniFB_enums.h>
+#include <MiniFB_types.h>
 //#define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 
@@ -14,7 +14,8 @@ typedef struct {
 #else
     BITMAPINFO          *bitmapInfo;
 #endif
-    HICON               hIcon;
+    HICON               hIconSmall;
+    HICON               hIconBig;
     struct mfb_timer    *timer;
     bool                mouse_inside;
 } SWindowData_Win;

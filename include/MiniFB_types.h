@@ -1,5 +1,5 @@
-#ifndef _MINIFB_ENUMS_H_
-#define _MINIFB_ENUMS_H_
+#ifndef _MINIFB_TYPES_H_
+#define _MINIFB_TYPES_H_
 
 #include <stdint.h>
 #include <stdbool.h>
@@ -174,6 +174,13 @@ typedef enum {
 // Opaque pointer
 struct mfb_window;
 struct mfb_timer;
+
+// Structures
+typedef struct {
+    void     *buffer;
+    unsigned width;
+    unsigned height;
+} mfb_image;
 
 // Event callbacks
 typedef void(*mfb_active_func)(struct mfb_window *window, bool isActive);

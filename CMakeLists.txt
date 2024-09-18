@@ -26,7 +26,7 @@ set(SrcLib
     include/MiniFB.h
     include/MiniFB_export.h
     include/MiniFB_version.h
-    include/MiniFB_enums.h
+    include/MiniFB_types.h
 
     src/MiniFB_version.c
     src/MiniFB_common.c

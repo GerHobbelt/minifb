@@ -2,7 +2,7 @@
 #import "OSXView.h"
 #include "WindowData_OSX.h"
 #include <MiniFB_internal.h>
-#include <MiniFB_enums.h>
+#include <MiniFB_types.h>
 
 @implementation OSXWindow
 

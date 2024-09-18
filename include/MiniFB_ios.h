@@ -1,6 +1,6 @@
 #pragma once
 
-#include "MiniFB_enums.h"
+#include "MiniFB_types.h"
 
 void user_implemented_init(struct mfb_window *window);
 
