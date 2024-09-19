@@ -32,8 +32,8 @@ MFB_EXPORT struct mfb_window * mfb_open_ex(const char *title, unsigned width, un
 
 #if defined(_WIN32) || defined(__linux__)
 
-MFB_EXPORT struct mfb_window * mfb_open_with_icons(const char *title, unsigned width, unsigned height, const mfb_image *icon_small, const mfb_image *icon_big);
-MFB_EXPORT struct mfb_window * mfb_open_ex_with_icons(const char *title, unsigned width, unsigned height, unsigned flags, const mfb_image *icon_small, const mfb_image *icon_big);
+MFB_EXPORT struct mfb_window * mfb_open_with_icons(const char *title, unsigned width, unsigned height, const mfb_icon_info *icon_small, const mfb_icon_info *icon_big);
+MFB_EXPORT struct mfb_window * mfb_open_ex_with_icons(const char *title, unsigned width, unsigned height, unsigned flags, const mfb_icon_info *icon_small, const mfb_icon_info *icon_big);
 
 #endif
 
@@ -43,7 +43,7 @@ MFB_EXPORT struct mfb_window * mfb_open_ex_with_icons(const char *title, unsigne
 // Also updates the window events
 MFB_EXPORT mfb_update_state    mfb_update(struct mfb_window *window, void *buffer);
 
-MFB_EXPORT mfb_update_state    mfb_update_ex(struct mfb_window *window, const mfb_image *image);
+MFB_EXPORT mfb_update_state    mfb_update_ex(struct mfb_window *window, void *buffer, unsigned width, unsigned height);
 
 // Only updates the window events
 MFB_EXPORT mfb_update_state    mfb_update_events(struct mfb_window *window);

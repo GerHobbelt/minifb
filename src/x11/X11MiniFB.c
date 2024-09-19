@@ -240,7 +240,7 @@ load_icon_from_buffer(uint32_t *buffer, unsigned width, unsigned height, int len
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 struct mfb_window *
-mfb_open_ex_with_icons(const char *title, unsigned width, unsigned height, unsigned flags, const mfb_image *icon_small, const mfb_image *icon_big) {
+mfb_open_ex_with_icons(const char *title, unsigned width, unsigned height, unsigned flags, const mfb_icon_info *icon_small, const mfb_icon_info *icon_big) {
     struct mfb_window *window           = mfb_open_ex(title, width, height, flags);
     SWindowData_X11   *window_data_x11;
     int                length_small;
@@ -486,7 +486,7 @@ processEvents(SWindowData *window_data) {
 void destroy_window_data(SWindowData *window_data);
 
 mfb_update_state
-mfb_update_ex(struct mfb_window *window, const mfb_image *image) {
+mfb_update_ex(struct mfb_window *window, void *buffer, unsigned width, unsigned height) {
     if (window == 0x0) {
         return STATE_INVALID_WINDOW;
     }
@@ -497,7 +497,7 @@ mfb_update_ex(struct mfb_window *window, const mfb_image *image) {
         return STATE_EXIT;
     }
 
-    if (image == 0x0 || image->buffer) {
+    if (buffer == 0x0) {
         return STATE_INVALID_BUFFER;
     }
 
@@ -506,10 +506,10 @@ mfb_update_ex(struct mfb_window *window, const mfb_image *image) {
     bool different_size = false;
 #endif
 
-    if(window_data->buffer_width != image->width || window_data->buffer_height != image->height) {
-        window_data->buffer_width  = image->width;
-        window_data->buffer_stride = image->width * 4;
-        window_data->buffer_height = image->height;
+    if(window_data->buffer_width != width || window_data->buffer_height != height) {
+        window_data->buffer_width  = width;
+        window_data->buffer_stride = width * 4;
+        window_data->buffer_height = height;
 #if !defined(USE_OPENGL_API)
         different_size = true;
 #endif
@@ -539,20 +539,20 @@ mfb_update_ex(struct mfb_window *window, const mfb_image *image) {
     }
 
     if (window_data_x11->image_scaler != 0x0) {
-        stretch_image((uint32_t *) image->buffer, 0, 0, window_data->buffer_width, window_data->buffer_height, window_data->buffer_width,
+        stretch_image((uint32_t *) buffer, 0, 0, window_data->buffer_width, window_data->buffer_height, window_data->buffer_width,
                       (uint32_t *) window_data_x11->image_buffer, 0, 0, window_data->dst_width, window_data->dst_height, window_data->dst_width);
         window_data_x11->image_scaler->data = (char *) window_data_x11->image_buffer;
         XPutImage(window_data_x11->display, window_data_x11->window, window_data_x11->gc, window_data_x11->image_scaler, 0, 0, window_data->dst_offset_x, window_data->dst_offset_y, window_data->dst_width, window_data->dst_height);
     }
     else {
-        window_data_x11->image->data = (char *) image->buffer;
+        window_data_x11->image->data = (char *) buffer;
         XPutImage(window_data_x11->display, window_data_x11->window, window_data_x11->gc, window_data_x11->image, 0, 0, window_data->dst_offset_x, window_data->dst_offset_y, window_data->dst_width, window_data->dst_height);
     }
     XFlush(window_data_x11->display);
 
 #else
 
-    redraw_GL(window_data, image->buffer);
+    redraw_GL(window_data, buffer);
 
 #endif
 

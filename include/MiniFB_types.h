@@ -180,7 +180,7 @@ typedef struct {
     void     *buffer;
     unsigned width;
     unsigned height;
-} mfb_image;
+} mfb_icon_info;
 
 // Event callbacks
 typedef void(*mfb_active_func)(struct mfb_window *window, bool isActive);

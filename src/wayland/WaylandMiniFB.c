@@ -736,14 +736,14 @@ wl_callback_listener frame_listener = {
 
 // TODO: implement stub
 struct mfb_window *
-mfb_open_ex_with_icons(const char *title, unsigned width, unsigned height, unsigned flags, const mfb_image *icon_small, const mfb_image *icon_big) {
+mfb_open_ex_with_icons(const char *title, unsigned width, unsigned height, unsigned flags, const mfb_icon_info *icon_small, const mfb_icon_info *icon_big) {
     return mfb_open_ex(title, width, height, flags);
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 mfb_update_state
-mfb_update_ex(struct mfb_window *window, const mfb_image *image)
+mfb_update_ex(struct mfb_window *window, void *buffer, unsigned width, unsigned height)
 {
     uint32_t done = 0;
 
@@ -757,7 +757,7 @@ mfb_update_ex(struct mfb_window *window, const mfb_image *image)
         return STATE_EXIT;
     }
 
-    if(image == 0x0 || image->buffer == 0x0) {
+    if(buffer == 0x0) {
         return STATE_INVALID_BUFFER;
     }
 
@@ -765,9 +765,9 @@ mfb_update_ex(struct mfb_window *window, const mfb_image *image)
     if (!window_data_way->display || wl_display_get_error(window_data_way->display) != 0)
         return STATE_INTERNAL_ERROR;
 
-    if(window_data->buffer_width != image->width || window_data->buffer_height != image->height) {
+    if(window_data->buffer_width != width || window_data->buffer_height != height) {
         uint32_t oldLength = sizeof(uint32_t) * window_data->buffer_width * window_data->buffer_height;
-        uint32_t length    = sizeof(uint32_t) * image->width * image->height;
+        uint32_t length    = sizeof(uint32_t) * width * height;
 
         // For some reason it crash when you make it smaller
         if(oldLength < length) {
@@ -782,12 +782,12 @@ mfb_update_ex(struct mfb_window *window, const mfb_image *image)
             wl_shm_pool_resize(window_data_way->shm_pool, length);
         }
 
-        window_data->buffer_width  = image->width;
-        window_data->buffer_height = image->height;
-        window_data->buffer_stride = image->width * sizeof(uint32_t);
+        window_data->buffer_width  = width;
+        window_data->buffer_height = height;
+        window_data->buffer_stride = width * sizeof(uint32_t);
 
         // This must be in the resize event but we don't have it for Wayland :(
-        resize_dst(window_data, image->width, image->height);
+        resize_dst(window_data, width, height);
 
         wl_buffer_destroy(window_data->draw_buffer);
         window_data->draw_buffer = wl_shm_pool_create_buffer(window_data_way->shm_pool, 0,
@@ -796,7 +796,7 @@ mfb_update_ex(struct mfb_window *window, const mfb_image *image)
     }
 
     // update shm buffer
-    memcpy(window_data_way->shm_ptr, image->buffer, window_data->buffer_stride * window_data->buffer_height);
+    memcpy(window_data_way->shm_ptr, buffer, window_data->buffer_stride * window_data->buffer_height);
 
     wl_surface_attach(window_data_way->surface, (struct wl_buffer *) window_data->draw_buffer, window_data->dst_offset_x, window_data->dst_offset_y);
     wl_surface_damage(window_data_way->surface, window_data->dst_offset_x, window_data->dst_offset_y, window_data->dst_width, window_data->dst_height);

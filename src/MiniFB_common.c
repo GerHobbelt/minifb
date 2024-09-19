@@ -16,7 +16,7 @@ mfb_open(const char *title, unsigned width, unsigned height) {
 
 //-------------------------------------
 struct mfb_window *
-mfb_open_with_icons(const char *title, unsigned width, unsigned height, const mfb_image *icon_small, const mfb_image *icon_big) {
+mfb_open_with_icons(const char *title, unsigned width, unsigned height, const mfb_icon_info *icon_small, const mfb_icon_info *icon_big) {
     return mfb_open_ex_with_icons(title, width, height, 0, icon_small, icon_big);
 }
 
@@ -30,9 +30,8 @@ mfb_update(struct mfb_window *window, void *buffer) {
     }
 
     SWindowData *window_data = (SWindowData *) window;
-    mfb_image    image       = { buffer, window_data->buffer_width, window_data->buffer_height };
 
-    return mfb_update_ex(window, &image);
+    return mfb_update_ex(window, buffer, window_data->buffer_width, window_data->buffer_height);
 }
 
 //-------------------------------------

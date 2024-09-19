@@ -641,7 +641,7 @@ load_icon_from_buffer(SWindowData_Win *window_data_win, void *buffer, unsigned w
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 struct mfb_window *
-mfb_open_ex_with_icons(const char *title, unsigned width, unsigned height, unsigned flags, const mfb_image *icon_small, const mfb_image *icon_big) {
+mfb_open_ex_with_icons(const char *title, unsigned width, unsigned height, unsigned flags, const mfb_icon_info *icon_small, const mfb_icon_info *icon_big) {
     struct mfb_window *window           = mfb_open_ex(title, width, height, flags);
     SWindowData_Win   *window_data_win;
 
@@ -671,7 +671,7 @@ mfb_open_ex_with_icons(const char *title, unsigned width, unsigned height, unsig
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 mfb_update_state
-mfb_update_ex(struct mfb_window *window, const mfb_image *image) {
+mfb_update_ex(struct mfb_window *window, void *buffer, unsigned width, unsigned height) {
     MSG msg;
 
     if (window == 0x0) {
@@ -684,14 +684,14 @@ mfb_update_ex(struct mfb_window *window, const mfb_image *image) {
         return STATE_EXIT;
     }
 
-    if (image == 0x0 || image->buffer == 0x0) {
+    if (buffer == 0x0) {
         return STATE_INVALID_BUFFER;
     }
 
-    window_data->draw_buffer   = image->buffer;
-    window_data->buffer_width  = image->width;
-    window_data->buffer_stride = image->width * 4;
-    window_data->buffer_height = image->height;
+    window_data->draw_buffer   = buffer;
+    window_data->buffer_width  = width;
+    window_data->buffer_stride = width * 4;
+    window_data->buffer_height = height;
 
     SWindowData_Win *window_data_win = (SWindowData_Win *) window_data->specific;
 
@@ -704,7 +704,7 @@ mfb_update_ex(struct mfb_window *window, const mfb_image *image) {
 
 #else
 
-    redraw_GL(window_data, image->buffer);
+    redraw_GL(window_data, buffer);
 
 #endif
 
