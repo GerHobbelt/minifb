@@ -6,6 +6,7 @@
 
 #define WAYLAND_MAX_OUTPUTS 16
 #define WAYLAND_BUFFER_SLOTS 3
+#define WAYLAND_CURSOR_THEME_CACHE_SIZE 8
 
 struct wl_display;
 struct wl_event_queue;
@@ -49,6 +50,20 @@ typedef struct {
 } SWaylandBufferSlot;
 
 typedef struct {
+    double  continuous_x;
+    double  continuous_y;
+    int64_t discrete_x;
+    int64_t discrete_y;
+    int64_t value120_x;
+    int64_t value120_y;
+    uint8_t pending;
+    uint8_t discrete_x_valid;
+    uint8_t discrete_y_valid;
+    uint8_t value120_x_valid;
+    uint8_t value120_y_valid;
+} SWaylandPointerAxisFrame;
+
+typedef struct {
     struct wl_display       *display;
     struct wl_registry      *registry;
     struct wl_compositor    *compositor;
@@ -59,10 +74,16 @@ typedef struct {
     struct wl_pointer       *pointer;
     struct wl_cursor_theme  *cursor_theme;
     struct wl_cursor        *default_cursor;
+    struct wl_cursor_theme  *cursor_theme_cache[WAYLAND_CURSOR_THEME_CACHE_SIZE];
+    struct wl_cursor        *default_cursor_cache[WAYLAND_CURSOR_THEME_CACHE_SIZE];
+    uint32_t                cursor_theme_cache_scales[WAYLAND_CURSOR_THEME_CACHE_SIZE];
+    uint32_t                cursor_theme_cache_count;
+    uint32_t                cursor_theme_scale;
     struct wl_surface       *cursor_surface;
     uint32_t                pointer_serial;
     uint32_t                pointer_enter_serial;
     uint8_t                 pointer_serial_valid;
+    SWaylandPointerAxisFrame pointer_axis_frame;
     uint8_t                 startup_state_applied;
     uint8_t                 request_fullscreen;
     uint8_t                 request_maximized;

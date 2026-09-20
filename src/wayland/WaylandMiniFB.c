@@ -19,6 +19,7 @@
 #include "MiniFB_enums.h"
 #include "WindowData.h"
 #include "WindowData_Way.h"
+#include "WaylandMiniFB_input_keyboard.h"
 
 #include <wayland-client.h>
 #include <wayland-cursor.h>
@@ -51,6 +52,7 @@
 #define MFB_STR(x) MFB_STR_IMPL(x)
 
 #define WAYLAND_FRACTIONAL_SCALE_DENOMINATOR 120.0f
+#define WAYLAND_DEFAULT_CURSOR_SIZE 32
 
 //-------------------------------------
 void init_keycodes();
@@ -59,11 +61,90 @@ void init_keycodes();
 // but defined later in the file.
 static void slot_destroy(SWaylandBufferSlot *slot);
 static bool slot_ensure_buffer(SWaylandBufferSlot *slot, SWindowData_Way *window_data_specific, uint32_t surface_w, uint32_t surface_h);
+static void clear_pointer_axis_frame(SWindowData_Way *window_data_specific);
+
+//-------------------------------------
+static void
+release_pointer(struct wl_pointer **pointer) {
+    if (pointer == NULL || *pointer == NULL) {
+        return;
+    }
+
+#if defined(WL_POINTER_RELEASE_SINCE_VERSION)
+    if (wl_proxy_get_version((struct wl_proxy *) *pointer) >= WL_POINTER_RELEASE_SINCE_VERSION) {
+        wl_pointer_release(*pointer);
+        *pointer = NULL;
+        return;
+    }
+#endif
+
+    wl_pointer_destroy(*pointer);
+    *pointer = NULL;
+}
+
+//-------------------------------------
+static void
+release_keyboard(struct wl_keyboard **keyboard) {
+    if (keyboard == NULL || *keyboard == NULL) {
+        return;
+    }
+
+#if defined(WL_KEYBOARD_RELEASE_SINCE_VERSION)
+    if (wl_proxy_get_version((struct wl_proxy *) *keyboard) >= WL_KEYBOARD_RELEASE_SINCE_VERSION) {
+        wl_keyboard_release(*keyboard);
+        *keyboard = NULL;
+        return;
+    }
+#endif
+
+    wl_keyboard_destroy(*keyboard);
+    *keyboard = NULL;
+}
+
+//-------------------------------------
+static void
+release_output(struct wl_output **output) {
+    if (output == NULL || *output == NULL) {
+        return;
+    }
+
+#if defined(WL_OUTPUT_RELEASE_SINCE_VERSION)
+    if (wl_proxy_get_version((struct wl_proxy *) *output) >= WL_OUTPUT_RELEASE_SINCE_VERSION) {
+        wl_output_release(*output);
+        *output = NULL;
+        return;
+    }
+#endif
+
+    wl_output_destroy(*output);
+    *output = NULL;
+}
+
+//-------------------------------------
+static void
+release_seat(struct wl_seat **seat) {
+    if (seat == NULL || *seat == NULL) {
+        return;
+    }
+
+#if defined(WL_SEAT_RELEASE_SINCE_VERSION)
+    if (wl_proxy_get_version((struct wl_proxy *) *seat) >= WL_SEAT_RELEASE_SINCE_VERSION) {
+        wl_seat_release(*seat);
+        *seat = NULL;
+        return;
+    }
+#endif
+
+    wl_seat_destroy(*seat);
+    *seat = NULL;
+}
 
 //-------------------------------------
 static inline void
-surface_damage(struct wl_surface *surface, uint32_t compositor_version,
-               int32_t x, int32_t y, int32_t w, int32_t h) {
+surface_damage(struct wl_surface *surface,
+               uint32_t compositor_version,
+               int32_t x, int32_t y,
+               int32_t w, int32_t h) {
     kUnused(compositor_version);
 #if defined(WL_SURFACE_DAMAGE_BUFFER_SINCE_VERSION)
     if (compositor_version >= WL_SURFACE_DAMAGE_BUFFER_SINCE_VERSION) {
@@ -73,6 +154,29 @@ surface_damage(struct wl_surface *surface, uint32_t compositor_version,
 #endif
     wl_surface_damage(surface, x, y, w, h);
 }
+
+//-------------------------------------
+static bool
+get_window_data(struct mfb_window *window, const char *func_name, SWindowData **window_data, SWindowData_Way **window_data_specific) {
+    const char *function_name = (func_name != NULL) ? func_name : "unknown";
+
+    if (window == NULL) {
+        MFB_LOG(MFB_LOG_ERROR, "WaylandMiniFB: %s called with a null window pointer.", function_name);
+        return false;
+    }
+
+    *window_data = (SWindowData *) window;
+    *window_data_specific = (SWindowData_Way *) (*window_data)->specific;
+    if (*window_data_specific == NULL) {
+        MFB_LOG(MFB_LOG_ERROR, "WaylandMiniFB: %s missing Wayland-specific window data.", function_name);
+        return false;
+    }
+
+    return true;
+}
+
+//-------------------------------------
+extern double g_time_for_frame;
 
 //-------------------------------------
 // Dual-queue dispatch infrastructure.
@@ -85,16 +189,6 @@ surface_damage(struct wl_surface *surface, uint32_t compositor_version,
 // for frame presentation, which would otherwise cause re-entrant updates or
 // stalls when the compositor holds buffers.
 //-------------------------------------
-
-//-------------------------------------
-static SWindowData_Way *
-get_window_data_specific(SWindowData *window_data) {
-    if (window_data == NULL) {
-        return NULL;
-    }
-
-    return (SWindowData_Way *) window_data->specific;
-}
 
 //-------------------------------------
 static void
@@ -192,10 +286,9 @@ flush_display(struct wl_display *display) {
 //-------------------------------------
 static int
 dispatch_queue_pending_count(SWindowData *window_data, struct wl_event_queue *queue) {
-    SWindowData_Way *window_data_specific = get_window_data_specific(window_data);
+    SWindowData_Way *window_data_specific = (SWindowData_Way *) window_data->specific;
 
-    if (window_data_specific == NULL ||
-        window_data_specific->display == NULL ||
+    if (window_data_specific->display == NULL ||
         queue == NULL) {
         return -1;
     }
@@ -206,10 +299,9 @@ dispatch_queue_pending_count(SWindowData *window_data, struct wl_event_queue *qu
 //-------------------------------------
 static bool
 dispatch_owned_pending(SWindowData *window_data) {
-    SWindowData_Way *window_data_specific = get_window_data_specific(window_data);
+    SWindowData_Way *window_data_specific = (SWindowData_Way *) window_data->specific;
 
-    if (window_data_specific == NULL ||
-        window_data_specific->display == NULL ||
+    if (window_data_specific->display == NULL ||
         window_data_specific->window_queue == NULL ||
         window_data_specific->render_queue == NULL) {
         return false;
@@ -229,10 +321,9 @@ dispatch_owned_pending(SWindowData *window_data) {
 //-------------------------------------
 static bool
 dispatch_render_pending(SWindowData *window_data) {
-    SWindowData_Way *window_data_specific = get_window_data_specific(window_data);
+    SWindowData_Way *window_data_specific = (SWindowData_Way *) window_data->specific;
 
-    if (window_data_specific == NULL ||
-        window_data_specific->display == NULL ||
+    if (window_data_specific->display == NULL ||
         window_data_specific->render_queue == NULL) {
         return false;
     }
@@ -249,15 +340,14 @@ static bool
 dispatch_queue_timeout(SWindowData *window_data,
                        struct wl_event_queue *read_queue,
                        const struct timespec *timeout) {
-    SWindowData_Way *window_data_specific = get_window_data_specific(window_data);
+    SWindowData_Way *window_data_specific = (SWindowData_Way *) window_data->specific;
     struct timespec now;
     struct timespec deadline = { 0, 0 };
     struct timespec remaining = { 0, 0 };
     const struct timespec *timeout_ptr = NULL;
     int result;
 
-    if (window_data_specific == NULL ||
-        window_data_specific->display == NULL ||
+    if (window_data_specific->display == NULL ||
         window_data_specific->window_queue == NULL ||
         window_data_specific->render_queue == NULL ||
         read_queue == NULL) {
@@ -348,11 +438,7 @@ dispatch_queue_timeout(SWindowData *window_data,
 //-------------------------------------
 static bool
 dispatch_owned_timeout(SWindowData *window_data, const struct timespec *timeout) {
-    SWindowData_Way *window_data_specific = get_window_data_specific(window_data);
-
-    if (window_data_specific == NULL) {
-        return false;
-    }
+    SWindowData_Way *window_data_specific = (SWindowData_Way *) window_data->specific;
 
     return dispatch_queue_timeout(window_data, window_data_specific->window_queue, timeout);
 }
@@ -360,13 +446,12 @@ dispatch_owned_timeout(SWindowData *window_data, const struct timespec *timeout)
 //-------------------------------------
 static bool
 dispatch_owned_non_blocking(SWindowData *window_data) {
-    SWindowData_Way *window_data_specific = get_window_data_specific(window_data);
+    SWindowData_Way *window_data_specific = (SWindowData_Way *) window_data->specific;
     struct wl_event_queue *read_queue;
     struct pollfd pfd;
     int result;
 
-    if (window_data_specific == NULL ||
-        window_data_specific->display == NULL ||
+    if (window_data_specific->display == NULL ||
         window_data_specific->window_queue == NULL) {
         return false;
     }
@@ -452,15 +537,23 @@ dispatch_owned_non_blocking(SWindowData *window_data) {
 //-------------------------------------
 static bool
 dispatch_render_blocking(SWindowData *window_data) {
-    SWindowData_Way *window_data_specific = get_window_data_specific(window_data);
+    SWindowData_Way *window_data_specific = (SWindowData_Way *) window_data->specific;
 
-    if (window_data_specific == NULL ||
-        window_data_specific->display == NULL ||
+    if (window_data_specific->display == NULL ||
         window_data_specific->render_queue == NULL) {
         return false;
     }
 
-    return dispatch_queue_timeout(window_data, window_data_specific->render_queue, NULL);
+    // Use a finite wait so window events can be processed and close/configure
+    // state can be re-checked when frame callbacks or buffer releases are delayed.
+    double frame_seconds = g_time_for_frame;
+    if (frame_seconds <= 0.0f) {
+        frame_seconds = 1.0 / 60.0;
+    }
+
+    struct timespec timeout = ms_to_ts(frame_seconds * 1000.0);
+
+    return dispatch_queue_timeout(window_data, window_data_specific->render_queue, &timeout);
 }
 
 //-------------------------------------
@@ -476,9 +569,8 @@ dispatch_render_blocking(SWindowData *window_data) {
 //-------------------------------------
 
 //-------------------------------------
-extern double g_time_for_frame;
 extern bool   g_use_hardware_sync;
-bool          g_use_wayland_frame_callback_throttle = false;
+bool          g_use_wayland_frame_callback_throttle = true;
 //-------------------------------------
 
 //-------------------------------------
@@ -504,13 +596,18 @@ wl_callback_listener g_throttle_listener = {
 //-------------------------------------
 static bool
 surface_throttle(SWindowData *window_data) {
-    SWindowData_Way *window_data_specific = get_window_data_specific(window_data);
+    SWindowData_Way *window_data_specific = (SWindowData_Way *) window_data->specific;
 
-    if (window_data_specific == NULL || window_data_specific->surface_wrapper == NULL) {
+    if (window_data_specific->surface_wrapper == NULL) {
         return false;
     }
 
     while (window_data_specific->throttle_callback != NULL) {
+        // Drain window_queue so xdg_toplevel.close / configure can break the wait.
+        if (dispatch_owned_non_blocking(window_data) == false) {
+            return false;
+        }
+
         if (window_data->close == true) {
             return false;
         }
@@ -531,31 +628,6 @@ surface_throttle(SWindowData *window_data) {
 
     wl_callback_add_listener(window_data_specific->throttle_callback, &g_throttle_listener, window_data_specific);
     return true;
-}
-
-//-------------------------------------
-static void
-update_mod_keys_from_xkb(SWindowData *window_data, SWindowData_Way *window_data_specific) {
-    if (window_data == NULL || window_data_specific == NULL || window_data_specific->xkb_state == NULL) {
-        return;
-    }
-
-    window_data->mod_keys = 0;
-    if (xkb_state_mod_name_is_active(window_data_specific->xkb_state, XKB_MOD_NAME_SHIFT, XKB_STATE_MODS_EFFECTIVE) > 0) {
-        window_data->mod_keys |= MFB_KB_MOD_SHIFT;
-    }
-
-    if (xkb_state_mod_name_is_active(window_data_specific->xkb_state, XKB_MOD_NAME_CTRL, XKB_STATE_MODS_EFFECTIVE) > 0) {
-        window_data->mod_keys |= MFB_KB_MOD_CONTROL;
-    }
-
-    if (xkb_state_mod_name_is_active(window_data_specific->xkb_state, XKB_MOD_NAME_ALT, XKB_STATE_MODS_EFFECTIVE) > 0) {
-        window_data->mod_keys |= MFB_KB_MOD_ALT;
-    }
-
-    if (xkb_state_mod_name_is_active(window_data_specific->xkb_state, XKB_MOD_NAME_LOGO, XKB_STATE_MODS_EFFECTIVE) > 0) {
-        window_data->mod_keys |= MFB_KB_MOD_SUPER;
-    }
 }
 
 //-------------------------------------
@@ -690,10 +762,18 @@ destroy(SWindowData *window_data) {
         window_data_specific->cursor_surface = NULL;
     }
 
-    if (window_data_specific->cursor_theme) {
-        wl_cursor_theme_destroy(window_data_specific->cursor_theme);
-        window_data_specific->cursor_theme = NULL;
+    for (uint32_t i = 0; i < window_data_specific->cursor_theme_cache_count; ++i) {
+        if (window_data_specific->cursor_theme_cache[i]) {
+            wl_cursor_theme_destroy(window_data_specific->cursor_theme_cache[i]);
+            window_data_specific->cursor_theme_cache[i] = NULL;
+        }
+        window_data_specific->default_cursor_cache[i] = NULL;
+        window_data_specific->cursor_theme_cache_scales[i] = 0;
     }
+    window_data_specific->cursor_theme_cache_count = 0;
+    window_data_specific->cursor_theme = NULL;
+    window_data_specific->default_cursor = NULL;
+    window_data_specific->cursor_theme_scale = 0;
 
     if (window_data_specific->shm) {
         wl_shm_destroy(window_data_specific->shm);
@@ -702,8 +782,7 @@ destroy(SWindowData *window_data) {
 
     for (uint32_t i = 0; i < window_data_specific->output_count; ++i) {
         if (window_data_specific->outputs[i]) {
-            wl_output_destroy(window_data_specific->outputs[i]);
-            window_data_specific->outputs[i] = NULL;
+            release_output(&window_data_specific->outputs[i]);
         }
     }
 
@@ -716,18 +795,16 @@ destroy(SWindowData *window_data) {
     }
 
     if (window_data_specific->keyboard) {
-        wl_keyboard_destroy(window_data_specific->keyboard);
-        window_data_specific->keyboard = NULL;
+        release_keyboard(&window_data_specific->keyboard);
     }
 
     if (window_data_specific->pointer) {
-        wl_pointer_destroy(window_data_specific->pointer);
-        window_data_specific->pointer = NULL;
+        clear_pointer_axis_frame(window_data_specific);
+        release_pointer(&window_data_specific->pointer);
     }
 
     if (window_data_specific->seat) {
-        wl_seat_destroy(window_data_specific->seat);
-        window_data_specific->seat = NULL;
+        release_seat(&window_data_specific->seat);
     }
 
     if (window_data_specific->registry) {
@@ -776,513 +853,210 @@ static struct xdg_wm_base_listener shell_listener = {
 };
 
 //-------------------------------------
+static void
+invalidate_pointer_serial_state(SWindowData_Way *window_data_specific) {
+    window_data_specific->pointer_serial = 0;
+    window_data_specific->pointer_enter_serial = 0;
+    window_data_specific->pointer_serial_valid = 0;
+}
+
+//-------------------------------------
+static void
+clear_pointer_axis_frame(SWindowData_Way *window_data_specific) {
+    if (window_data_specific != NULL) {
+        memset(&window_data_specific->pointer_axis_frame, 0,
+               sizeof(window_data_specific->pointer_axis_frame));
+    }
+}
+
+//-------------------------------------
 static bool
-utf8_decode_next(const unsigned char *bytes, size_t length, size_t *index, uint32_t *codepoint) {
-    if (bytes == NULL || index == NULL || codepoint == NULL || *index >= length) {
-        return false;
+pointer_uses_frame_events(struct wl_pointer *pointer) {
+#if defined(WL_POINTER_FRAME_SINCE_VERSION)
+    return pointer != NULL
+        && wl_proxy_get_version((struct wl_proxy *) pointer) >= WL_POINTER_FRAME_SINCE_VERSION;
+#else
+    kUnused(pointer);
+    return false;
+#endif
+}
+
+//-------------------------------------
+static uint32_t
+get_cursor_buffer_scale(const SWindowData_Way *window_data_specific) {
+    uint32_t scale = 1;
+
+#if defined(WL_SURFACE_SET_BUFFER_SCALE_SINCE_VERSION)
+    if (window_data_specific->compositor_version >= WL_SURFACE_SET_BUFFER_SCALE_SINCE_VERSION) {
+        if (window_data_specific->preferred_scale_120 > 0) {
+            scale = (window_data_specific->preferred_scale_120 + 119u) / 120u;
+        }
+        else if (window_data_specific->integer_output_scale > 0) {
+            scale = window_data_specific->integer_output_scale;
+        }
+    }
+#endif
+
+    if (scale == 0) {
+        scale = 1;
     }
 
-    unsigned char c0 = bytes[*index];
-    if (c0 < 0x80) {
-        *codepoint = c0;
-        *index += 1;
+    return scale;
+}
+
+//-------------------------------------
+static int
+find_cursor_theme_cache_index(const SWindowData_Way *window_data_specific, uint32_t scale) {
+    for (uint32_t i = 0; i < window_data_specific->cursor_theme_cache_count; ++i) {
+        if (window_data_specific->cursor_theme_cache_scales[i] == scale) {
+            return (int) i;
+        }
+    }
+
+    return -1;
+}
+
+//-------------------------------------
+static bool
+ensure_cursor_theme_for_scale(SWindowData_Way *window_data_specific, uint32_t scale) {
+    if (scale == 0) {
+        scale = 1;
+    }
+
+    if (window_data_specific->cursor_theme != NULL &&
+        window_data_specific->default_cursor != NULL &&
+        window_data_specific->cursor_theme_scale == scale) {
         return true;
     }
 
-    if ((c0 & 0xe0) == 0xc0 && *index + 1 < length) {
-        unsigned char c1 = bytes[*index + 1];
-        if ((c1 & 0xc0) == 0x80) {
-            uint32_t cp = ((uint32_t) (c0 & 0x1f) << 6) | (uint32_t) (c1 & 0x3f);
-            if (cp >= 0x80) {
-                *codepoint = cp;
-                *index += 2;
-                return true;
-            }
-        }
-    }
-    else if ((c0 & 0xf0) == 0xe0 && *index + 2 < length) {
-        unsigned char c1 = bytes[*index + 1];
-        unsigned char c2 = bytes[*index + 2];
-        if ((c1 & 0xc0) == 0x80 && (c2 & 0xc0) == 0x80) {
-            uint32_t cp = ((uint32_t) (c0 & 0x0f) << 12) |
-                          ((uint32_t) (c1 & 0x3f) << 6) |
-                          (uint32_t) (c2 & 0x3f);
-            if (cp >= 0x800 && !(cp >= 0xd800 && cp <= 0xdfff)) {
-                *codepoint = cp;
-                *index += 3;
-                return true;
-            }
-        }
-    }
-    else if ((c0 & 0xf8) == 0xf0 && *index + 3 < length) {
-        unsigned char c1 = bytes[*index + 1];
-        unsigned char c2 = bytes[*index + 2];
-        unsigned char c3 = bytes[*index + 3];
-        if ((c1 & 0xc0) == 0x80 && (c2 & 0xc0) == 0x80 && (c3 & 0xc0) == 0x80) {
-            uint32_t cp = ((uint32_t) (c0 & 0x07) << 18) |
-                          ((uint32_t) (c1 & 0x3f) << 12) |
-                          ((uint32_t) (c2 & 0x3f) << 6) |
-                          (uint32_t) (c3 & 0x3f);
-            if (cp >= 0x10000 && cp <= 0x10ffff) {
-                *codepoint = cp;
-                *index += 4;
-                return true;
-            }
-        }
+    int cache_index = find_cursor_theme_cache_index(window_data_specific, scale);
+    if (cache_index >= 0) {
+        window_data_specific->cursor_theme = window_data_specific->cursor_theme_cache[cache_index];
+        window_data_specific->default_cursor = window_data_specific->default_cursor_cache[cache_index];
+        window_data_specific->cursor_theme_scale = scale;
+        return true;
     }
 
-    *index += 1;
-    return false;
+    if (window_data_specific->shm == NULL) {
+        return false;
+    }
+
+    if (window_data_specific->cursor_theme_cache_count >= WAYLAND_CURSOR_THEME_CACHE_SIZE) {
+        MFB_LOG(MFB_LOG_WARNING, "WaylandMiniFB: cursor theme cache is full; keeping the current cursor theme.");
+        return window_data_specific->cursor_theme != NULL && window_data_specific->default_cursor != NULL;
+    }
+
+    if (scale > (uint32_t) (INT_MAX / WAYLAND_DEFAULT_CURSOR_SIZE)) {
+        return false;
+    }
+
+    int theme_size = (int) (WAYLAND_DEFAULT_CURSOR_SIZE * scale);
+    struct wl_cursor_theme *theme = wl_cursor_theme_load(NULL, theme_size, window_data_specific->shm);
+    if (theme == NULL) {
+        return false;
+    }
+
+    struct wl_cursor *cursor = wl_cursor_theme_get_cursor(theme, "left_ptr");
+    if (cursor == NULL || cursor->image_count == 0) {
+        wl_cursor_theme_destroy(theme);
+        return false;
+    }
+
+    uint32_t cache_slot = window_data_specific->cursor_theme_cache_count++;
+    window_data_specific->cursor_theme_cache[cache_slot] = theme;
+    window_data_specific->default_cursor_cache[cache_slot] = cursor;
+    window_data_specific->cursor_theme_cache_scales[cache_slot] = scale;
+
+    window_data_specific->cursor_theme = theme;
+    window_data_specific->default_cursor = cursor;
+    window_data_specific->cursor_theme_scale = scale;
+
+    return true;
 }
 
-//-------------------------------------
-static const char *
-get_compose_locale(void) {
-    const char *locale;
-    locale = getenv("LC_ALL");
-    if (locale && *locale) return locale;
-    locale = getenv("LC_CTYPE");
-    if (locale && *locale) return locale;
-    locale = getenv("LANG");
-    if (locale && *locale) return locale;
-    return "C";
-}
-
-//-------------------------------------
-// This event provides a file descriptor to the client which can be memory-mapped
-// to provide a keyboard mapping description.
-// format: keymap format
-// fd:     keymap file descriptor
-// size:   keymap size, in bytes
 //-------------------------------------
 static void
-keyboard_keymap(void *data, struct wl_keyboard *keyboard, uint32_t format, int fd, uint32_t size) {
-    SWindowData *window_data = (SWindowData *) data;
+refresh_cursor_surface(SWindowData *window_data) {
     SWindowData_Way *window_data_specific = window_data ? (SWindowData_Way *) window_data->specific : NULL;
-    kUnused(keyboard);
-
-    if (window_data_specific == NULL) {
-        if (fd >= 0) {
-            close(fd);
-        }
-        MFB_LOG(MFB_LOG_ERROR, "WaylandMiniFB: keyboard_keymap received without valid window state.");
+    if (window_data_specific == NULL ||
+        window_data_specific->pointer == NULL ||
+        window_data_specific->cursor_surface == NULL ||
+        window_data_specific->pointer_serial_valid == 0) {
         return;
     }
 
-    if (format != WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1 || fd < 0 || size == 0) {
-        if (fd >= 0) {
-            close(fd);
-        }
-        MFB_LOG(MFB_LOG_ERROR, "WaylandMiniFB: unsupported or invalid keymap payload.");
+    uint32_t serial = window_data_specific->pointer_enter_serial;
+    if (window_data->is_cursor_visible == false) {
+        wl_pointer_set_cursor(window_data_specific->pointer, serial, NULL, 0, 0);
         return;
     }
 
-    char *keymap_data = mmap(NULL, size, PROT_READ, MAP_PRIVATE, fd, 0);
-    close(fd);
-    if (keymap_data == MAP_FAILED) {
-        MFB_LOG(MFB_LOG_ERROR, "WaylandMiniFB: failed to map Wayland keymap (%s).", strerror(errno));
+    uint32_t cursor_scale = get_cursor_buffer_scale(window_data_specific);
+    if (ensure_cursor_theme_for_scale(window_data_specific, cursor_scale) == false) {
+        MFB_LOG(MFB_LOG_WARNING, "WaylandMiniFB: failed to load cursor theme for scale %u.", cursor_scale);
         return;
     }
 
-    if (window_data_specific->xkb_context == NULL) {
-        window_data_specific->xkb_context = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
-        if (window_data_specific->xkb_context == NULL) {
-            munmap(keymap_data, size);
-            MFB_LOG(MFB_LOG_ERROR, "WaylandMiniFB: xkb_context_new failed.");
+    uint32_t applied_scale = 1;
+#if defined(WL_SURFACE_SET_BUFFER_SCALE_SINCE_VERSION)
+    if (window_data_specific->compositor_version >= WL_SURFACE_SET_BUFFER_SCALE_SINCE_VERSION) {
+        applied_scale = window_data_specific->cursor_theme_scale > 0 ? window_data_specific->cursor_theme_scale : 1u;
+    }
+#endif
+
+    struct wl_cursor *cursor = window_data_specific->default_cursor;
+    if (cursor == NULL || cursor->image_count == 0) {
+        return;
+    }
+
+    struct wl_cursor_image *image = cursor->images[0];
+    if (applied_scale > 1 &&
+        (image->width % applied_scale != 0 || image->height % applied_scale != 0)) {
+        MFB_LOG(MFB_LOG_WARNING, "WaylandMiniFB: cursor image %ux%u is incompatible with buffer scale %u; retrying with scale 1.",
+                image->width, image->height, applied_scale);
+
+        if (ensure_cursor_theme_for_scale(window_data_specific, 1) == false) {
             return;
         }
+
+        cursor = window_data_specific->default_cursor;
+        if (cursor == NULL || cursor->image_count == 0) {
+            return;
+        }
+
+        image = cursor->images[0];
+        applied_scale = 1;
     }
 
-    struct xkb_keymap *keymap = xkb_keymap_new_from_string(window_data_specific->xkb_context,
-                                                            keymap_data,
-                                                            XKB_KEYMAP_FORMAT_TEXT_V1,
-                                                            XKB_KEYMAP_COMPILE_NO_FLAGS);
-    munmap(keymap_data, size);
-    if (keymap == NULL) {
-        MFB_LOG(MFB_LOG_ERROR, "WaylandMiniFB: xkb_keymap_new_from_string failed.");
+    struct wl_buffer *buffer = wl_cursor_image_get_buffer(image);
+    if (buffer == NULL) {
+        MFB_LOG(MFB_LOG_ERROR, "WaylandMiniFB: wl_cursor_image_get_buffer returned NULL.");
         return;
     }
 
-    struct xkb_state *state = xkb_state_new(keymap);
-    if (state == NULL) {
-        xkb_keymap_unref(keymap);
-        MFB_LOG(MFB_LOG_ERROR, "WaylandMiniFB: xkb_state_new failed.");
-        return;
+#if defined(WL_SURFACE_SET_BUFFER_SCALE_SINCE_VERSION)
+    if (window_data_specific->compositor_version >= WL_SURFACE_SET_BUFFER_SCALE_SINCE_VERSION) {
+        wl_surface_set_buffer_scale(window_data_specific->cursor_surface, (int32_t) applied_scale);
     }
-
-    if (window_data_specific->xkb_state) {
-        xkb_state_unref(window_data_specific->xkb_state);
-    }
-    if (window_data_specific->xkb_keymap) {
-        xkb_keymap_unref(window_data_specific->xkb_keymap);
-    }
-
-    window_data_specific->xkb_keymap = keymap;
-    window_data_specific->xkb_state = state;
-
-    // (Re)create compose table and state for dead-key support
-    if (window_data_specific->xkb_compose_state) {
-        xkb_compose_state_unref(window_data_specific->xkb_compose_state);
-        window_data_specific->xkb_compose_state = NULL;
-    }
-    if (window_data_specific->xkb_compose_table) {
-        xkb_compose_table_unref(window_data_specific->xkb_compose_table);
-        window_data_specific->xkb_compose_table = NULL;
-    }
-
-    const char *locale = get_compose_locale();
-    struct xkb_compose_table *compose_table = xkb_compose_table_new_from_locale(
-        window_data_specific->xkb_context, locale, XKB_COMPOSE_COMPILE_NO_FLAGS);
-    if (compose_table != NULL) {
-        struct xkb_compose_state *compose_state = xkb_compose_state_new(
-            compose_table, XKB_COMPOSE_STATE_NO_FLAGS);
-        if (compose_state != NULL) {
-            window_data_specific->xkb_compose_table = compose_table;
-            window_data_specific->xkb_compose_state = compose_state;
-        }
-        else {
-            xkb_compose_table_unref(compose_table);
-            MFB_LOG(MFB_LOG_WARNING, "xkb_compose_state_new failed; dead keys will not work");
-        }
-    }
-    else {
-        MFB_LOG(MFB_LOG_DEBUG, "xkb_compose_table_new_from_locale('%s') failed; dead keys will not work", locale);
-    }
-}
-
-//-------------------------------------
-// Clear all keyboard state: key_status, mod_keys, and xkb_state.
-// Used on keyboard_leave and when the seat loses keyboard capability.
-//-------------------------------------
-static void
-reset_keyboard_state(SWindowData *window_data, SWindowData_Way *window_data_specific) {
-    memset(window_data->key_status, 0, sizeof(window_data->key_status));
-    window_data->mod_keys = 0;
-
-    if (window_data_specific != NULL
-        && window_data_specific->xkb_keymap != NULL
-        && window_data_specific->xkb_state != NULL) {
-        struct xkb_state *fresh = xkb_state_new(window_data_specific->xkb_keymap);
-        if (fresh != NULL) {
-            xkb_state_unref(window_data_specific->xkb_state);
-            window_data_specific->xkb_state = fresh;
-        }
-    }
-
-    if (window_data_specific != NULL) {
-        if (window_data_specific->xkb_compose_state != NULL) {
-            xkb_compose_state_reset(window_data_specific->xkb_compose_state);
-        }
-        window_data_specific->compose_sequence_count = 0;
-    }
-}
-
-//-------------------------------------
-// Rebuild keyboard state from the compositor's pressed-key list.
-// Assumes reset_keyboard_state was called first.
-// Does not emit synthetic keyboard callbacks — only synchronizes state.
-//-------------------------------------
-static void
-rebuild_keyboard_state_from_keys(SWindowData *window_data, SWindowData_Way *window_data_specific, struct wl_array *keys) {
-    if (keys == NULL) {
-        return;
-    }
-
-    uint32_t *key;
-    wl_array_for_each(key, keys) {
-        if (*key < 512) {
-            mfb_key key_code = (mfb_key) g_keycodes[*key];
-            if (key_code != MFB_KB_KEY_UNKNOWN && key_code >= 0 && key_code < MFB_MAX_KEYS) {
-                window_data->key_status[key_code] = true;
-            }
-            // Update xkb_state so mod_keys reflects held modifiers.
-            if (window_data_specific != NULL && window_data_specific->xkb_state != NULL) {
-                xkb_keycode_t xkb_keycode = (xkb_keycode_t) *key + 8;
-                xkb_state_update_key(window_data_specific->xkb_state, xkb_keycode, XKB_KEY_DOWN);
-            }
-        }
-    }
-
-    if (window_data_specific != NULL) {
-        update_mod_keys_from_xkb(window_data, window_data_specific);
-    }
-}
-
-//-------------------------------------
-// Notification that this seat's keyboard focus is on a certain surface.
-// serial:  serial number of the enter event
-// surface: surface gaining keyboard focus
-// keys:    the currently pressed keys
-//-------------------------------------
-static void
-keyboard_enter(void *data, struct wl_keyboard *keyboard, uint32_t serial, struct wl_surface *surface, struct wl_array *keys) {
-    kUnused(keyboard);
-    kUnused(serial);
-    kUnused(surface);
-
-    SWindowData *window_data = (SWindowData *) data;
-    SWindowData_Way *window_data_specific = window_data ? (SWindowData_Way *) window_data->specific : NULL;
-
-    window_data->is_active = true;
-    reset_keyboard_state(window_data, window_data_specific);
-    rebuild_keyboard_state_from_keys(window_data, window_data_specific, keys);
-    kCall(active_func, true);
-}
-
-//-------------------------------------
-// The leave notification is sent before the enter notification for the new focus.
-// serial:  serial number of the leave event
-// surface: surface that lost keyboard focus
-//-------------------------------------
-static void
-keyboard_leave(void *data, struct wl_keyboard *keyboard, uint32_t serial, struct wl_surface *surface) {
-    kUnused(keyboard);
-    kUnused(serial);
-    kUnused(surface);
-
-    SWindowData *window_data = (SWindowData *) data;
-    SWindowData_Way *window_data_specific = window_data ? (SWindowData_Way *) window_data->specific : NULL;
-
-    window_data->is_active = false;
-    reset_keyboard_state(window_data, window_data_specific);
-    kCall(active_func, false);
-}
-
-//-------------------------------------
-// Emit a Unicode codepoint for the given xkb key if one exists.
-//-------------------------------------
-static void
-emit_char_input_from_xkb_state(SWindowData *window_data, SWindowData_Way *window_data_specific, xkb_keycode_t xkb_keycode) {
-    uint32_t codepoint = xkb_state_key_get_utf32(window_data_specific->xkb_state, xkb_keycode);
-    if (codepoint != 0) {
-        kCall(char_input_func, codepoint);
-    }
-}
-
-//-------------------------------------
-// A key changed logical state. The time argument is a timestamp with
-// millisecond granularity, with an undefined base.
-// serial: serial number of the key event
-// time:   timestamp with millisecond granularity
-// key:    key that produced the event
-// state:  logical key state reported by the compositor
-//-------------------------------------
-static void
-keyboard_key(void *data, struct wl_keyboard *keyboard, uint32_t serial, uint32_t time, uint32_t key, uint32_t state) {
-    kUnused(keyboard);
-    kUnused(serial);
-    kUnused(time);
-
-    SWindowData *window_data = (SWindowData *) data;
-    SWindowData_Way *window_data_specific = (SWindowData_Way *) window_data->specific;
-    if (key < 512) {
-        mfb_key key_code = (mfb_key) g_keycodes[key];
-        bool   is_pressed = false;
-        bool   should_emit_key_press = false;
-        bool   should_update_xkb_state = false;
-#if defined(WL_KEYBOARD_KEY_STATE_REPEATED_SINCE_VERSION)
-        bool   is_repeated = false;
 #endif
 
-        switch (state) {
-            case WL_KEYBOARD_KEY_STATE_RELEASED:
-                should_update_xkb_state = true;
-                break;
-
-            case WL_KEYBOARD_KEY_STATE_PRESSED:
-                is_pressed = true;
-                should_emit_key_press = true;
-                should_update_xkb_state = true;
-                break;
-
-#if defined(WL_KEYBOARD_KEY_STATE_REPEATED_SINCE_VERSION)
-            case WL_KEYBOARD_KEY_STATE_REPEATED:
-                is_pressed = true;
-                should_emit_key_press = true;
-                is_repeated = true;
-                break;
-#endif
-
-            default:
-                MFB_LOG(MFB_LOG_WARNING, "WaylandMiniFB: ignoring unknown wl_keyboard key state %u.", state);
-                return;
-        }
-
-        if (window_data_specific && window_data_specific->xkb_state) {
-            xkb_keycode_t xkb_keycode = (xkb_keycode_t) key + 8;
-            if (should_update_xkb_state) {
-                xkb_state_update_key(window_data_specific->xkb_state, xkb_keycode, is_pressed ? XKB_KEY_DOWN : XKB_KEY_UP);
-                update_mod_keys_from_xkb(window_data, window_data_specific);
-            }
-            if (should_emit_key_press) {
-#if defined(WL_KEYBOARD_KEY_STATE_REPEATED_SINCE_VERSION)
-                if (is_repeated) {
-                    emit_char_input_from_xkb_state(window_data, window_data_specific, xkb_keycode);
-                }
-                else
-#endif
-                if (window_data_specific->xkb_compose_state) {
-                    xkb_keysym_t keysym = xkb_state_key_get_one_sym(window_data_specific->xkb_state, xkb_keycode);
-                    xkb_compose_state_feed(window_data_specific->xkb_compose_state, keysym);
-                    enum xkb_compose_status status = xkb_compose_state_get_status(window_data_specific->xkb_compose_state);
-                    if (status == XKB_COMPOSE_COMPOSED) {
-                        bool emitted = false;
-                        xkb_keysym_t composed_sym = xkb_compose_state_get_one_sym(window_data_specific->xkb_compose_state);
-                        if (composed_sym != XKB_KEY_NoSymbol) {
-                            uint32_t codepoint = xkb_keysym_to_utf32(composed_sym);
-                            if (codepoint != 0) {
-                                kCall(char_input_func, codepoint);
-                                emitted = true;
-                            }
-                        }
-                        if (emitted == false) {
-                            // Fallback: compose result has no keysym, decode UTF-8
-                            char buf[64];
-                            int len = xkb_compose_state_get_utf8(window_data_specific->xkb_compose_state, buf, sizeof(buf));
-                            if (len > 0) {
-                                size_t actual = ((size_t) len < sizeof(buf) - 1) ? (size_t) len : sizeof(buf) - 1;
-                                size_t idx = 0;
-                                uint32_t cp;
-                                while (utf8_decode_next((const unsigned char *) buf, actual, &idx, &cp)) {
-                                    if (cp != 0) {
-                                        kCall(char_input_func, cp);
-                                    }
-                                }
-                            }
-                        }
-                        window_data_specific->compose_sequence_count = 0;
-                        xkb_compose_state_reset(window_data_specific->xkb_compose_state);
-                    }
-                    else if (status == XKB_COMPOSE_CANCELLED) {
-                        // Replay buffered keycodes + cancelling key as individual characters
-                        for (uint8_t i = 0; i < window_data_specific->compose_sequence_count; ++i) {
-                            uint32_t codepoint = xkb_state_key_get_utf32(window_data_specific->xkb_state, window_data_specific->compose_sequence[i]);
-                            if (codepoint != 0) {
-                                kCall(char_input_func, codepoint);
-                            }
-                        }
-                        uint32_t codepoint = xkb_state_key_get_utf32(window_data_specific->xkb_state, xkb_keycode);
-                        if (codepoint != 0) {
-                            kCall(char_input_func, codepoint);
-                        }
-                        window_data_specific->compose_sequence_count = 0;
-                        xkb_compose_state_reset(window_data_specific->xkb_compose_state);
-                    }
-                    else if (status == XKB_COMPOSE_COMPOSING) {
-                        // Dead key pending — buffer keycode, don't emit
-                        if (window_data_specific->compose_sequence_count < 8) {
-                            window_data_specific->compose_sequence[window_data_specific->compose_sequence_count++] = xkb_keycode;
-                        }
-                    }
-                    else if (status == XKB_COMPOSE_NOTHING) {
-                        emit_char_input_from_xkb_state(window_data, window_data_specific, xkb_keycode);
-                    }
-                }
-                else {
-                    emit_char_input_from_xkb_state(window_data, window_data_specific, xkb_keycode);
-                }
-            }
-        }
-
-        else {
-            switch (key_code) {
-                case MFB_KB_KEY_LEFT_SHIFT:
-                case MFB_KB_KEY_RIGHT_SHIFT:
-                    if (is_pressed)
-                        window_data->mod_keys |= MFB_KB_MOD_SHIFT;
-                    else
-                        window_data->mod_keys &= ~MFB_KB_MOD_SHIFT;
-                    break;
-
-                case MFB_KB_KEY_LEFT_CONTROL:
-                case MFB_KB_KEY_RIGHT_CONTROL:
-                    if (is_pressed)
-                        window_data->mod_keys |= MFB_KB_MOD_CONTROL;
-                    else
-                        window_data->mod_keys &= ~MFB_KB_MOD_CONTROL;
-                    break;
-
-                case MFB_KB_KEY_LEFT_ALT:
-                case MFB_KB_KEY_RIGHT_ALT:
-                    if (is_pressed)
-                        window_data->mod_keys |= MFB_KB_MOD_ALT;
-                    else
-                        window_data->mod_keys &= ~MFB_KB_MOD_ALT;
-                    break;
-
-                case MFB_KB_KEY_LEFT_SUPER:
-                case MFB_KB_KEY_RIGHT_SUPER:
-                    if (is_pressed)
-                        window_data->mod_keys |= MFB_KB_MOD_SUPER;
-                    else
-                        window_data->mod_keys &= ~MFB_KB_MOD_SUPER;
-                    break;
-            }
-        }
-
-        if (key_code != MFB_KB_KEY_UNKNOWN && key_code >= 0 && key_code < MFB_MAX_KEYS) {
-            window_data->key_status[key_code] = is_pressed;
-            kCall(keyboard_func, key_code, (mfb_key_mod) window_data->mod_keys, is_pressed);
-        }
+    int32_t hotspot_x = (int32_t) image->hotspot_x;
+    int32_t hotspot_y = (int32_t) image->hotspot_y;
+    if (applied_scale > 1) {
+        hotspot_x = (hotspot_x + (int32_t) (applied_scale / 2)) / (int32_t) applied_scale;
+        hotspot_y = (hotspot_y + (int32_t) (applied_scale / 2)) / (int32_t) applied_scale;
     }
+
+    wl_pointer_set_cursor(window_data_specific->pointer, serial,
+                          window_data_specific->cursor_surface,
+                          hotspot_x, hotspot_y);
+    wl_surface_attach(window_data_specific->cursor_surface, buffer, 0, 0);
+    surface_damage(window_data_specific->cursor_surface,
+                   window_data_specific->compositor_version,
+                   0, 0,
+                   image->width, image->height);
+    wl_surface_commit(window_data_specific->cursor_surface);
 }
-
-//-------------------------------------
-// Notifies clients that the modifier and/or group state has changed,
-// and it should update its local state.
-// serial:         serial number of the modifiers event
-// mods_depressed: depressed modifiers
-// mods_latched:   latched modifiers
-// mods_locked:    locked modifiers
-// group:          keyboard layout
-//-------------------------------------
-static void
-keyboard_modifiers(void *data, struct wl_keyboard *keyboard, uint32_t serial, uint32_t mods_depressed, uint32_t mods_latched, uint32_t mods_locked, uint32_t group) {
-    kUnused(keyboard);
-    kUnused(serial);
-
-    SWindowData *window_data = (SWindowData *) data;
-    SWindowData_Way *window_data_specific = window_data ? (SWindowData_Way *) window_data->specific : NULL;
-    if (window_data_specific && window_data_specific->xkb_state) {
-        xkb_state_update_mask(window_data_specific->xkb_state,
-                              mods_depressed,
-                              mods_latched,
-                              mods_locked,
-                              0, 0,
-                              group);
-        update_mod_keys_from_xkb(window_data, window_data_specific);
-    }
-}
-
-#if defined(WL_KEYBOARD_REPEAT_INFO_SINCE_VERSION)
-
-//-------------------------------------
-// Informs the client about the keyboard's repeat rate and delay.
-// rate:  the rate of repeating keys in characters per second
-// delay: delay in milliseconds since key down until repeating starts
-//-------------------------------------
-static void
-keyboard_repeat_info(void *data, struct wl_keyboard *keyboard, int32_t rate, int32_t delay) {
-    kUnused(data);
-    kUnused(keyboard);
-    kUnused(rate);
-    kUnused(delay);
-}
-
-#endif
-
-//-------------------------------------
-static const struct
-wl_keyboard_listener keyboard_listener = {
-    .keymap      = keyboard_keymap,
-    .enter       = keyboard_enter,
-    .leave       = keyboard_leave,
-    .key         = keyboard_key,
-    .modifiers   = keyboard_modifiers,
-#if defined(WL_KEYBOARD_REPEAT_INFO_SINCE_VERSION)
-    .repeat_info = keyboard_repeat_info,
-#endif
-};
 
 //-------------------------------------
 // Notification that this seat's pointer is focused on a certain surface.
@@ -1298,11 +1072,8 @@ wl_keyboard_listener keyboard_listener = {
 //-------------------------------------
 static void
 pointer_enter(void *data, struct wl_pointer *pointer, uint32_t serial, struct wl_surface *surface, wl_fixed_t sx, wl_fixed_t sy) {
-    //kUnused(pointer);
-    //kUnused(serial);
+    kUnused(pointer);
     kUnused(surface);
-    struct wl_buffer *buffer;
-    struct wl_cursor_image *image;
 
     SWindowData *window_data = (SWindowData *) data;
     if (window_data == NULL)
@@ -1318,27 +1089,7 @@ pointer_enter(void *data, struct wl_pointer *pointer, uint32_t serial, struct wl
     window_data->mouse_pos_x = wl_fixed_to_int(sx);
     window_data->mouse_pos_y = wl_fixed_to_int(sy);
 
-    if (window_data->is_cursor_visible) {
-        if (window_data_specific->default_cursor == NULL ||
-            window_data_specific->default_cursor->image_count == 0 ||
-            window_data_specific->cursor_surface == NULL) {
-            return;
-        }
-        image  = window_data_specific->default_cursor->images[0];
-        buffer = wl_cursor_image_get_buffer(image);
-        if (buffer == NULL) {
-            return;
-        }
-
-        wl_pointer_set_cursor(pointer, serial, window_data_specific->cursor_surface, image->hotspot_x, image->hotspot_y);
-        wl_surface_attach(window_data_specific->cursor_surface, buffer, 0, 0);
-        surface_damage(window_data_specific->cursor_surface, window_data_specific->compositor_version,
-                       0, 0, image->width, image->height);
-        wl_surface_commit(window_data_specific->cursor_surface);
-    }
-    else {
-        wl_pointer_set_cursor(pointer, serial, NULL, 0, 0);
-    }
+    refresh_cursor_surface(window_data);
 
     //MFB_LOG(MFB_LOG_DEBUG, "Pointer entered surface %p at %d %d (serial: %d)", surface, sx, sy, serial);
 }
@@ -1360,7 +1111,8 @@ pointer_leave(void *data, struct wl_pointer *pointer, uint32_t serial, struct wl
     SWindowData *window_data = (SWindowData *) data;
     SWindowData_Way *window_data_specific = window_data ? (SWindowData_Way *) window_data->specific : NULL;
     if (window_data_specific) {
-        window_data_specific->pointer_serial_valid = 0;
+        invalidate_pointer_serial_state(window_data_specific);
+        clear_pointer_axis_frame(window_data_specific);
     }
 
     //MFB_LOG(MFB_LOG_DEBUG, "Pointer left surface %p (serial: %d)", surface, serial);
@@ -1457,29 +1209,82 @@ pointer_button(void *data, struct wl_pointer *pointer, uint32_t serial, uint32_t
 //-------------------------------------
 static void
 pointer_axis(void *data, struct wl_pointer *pointer, uint32_t time, uint32_t axis, wl_fixed_t value) {
-    kUnused(pointer);
     kUnused(time);
-    kUnused(axis);
 
     //MFB_LOG(MFB_LOG_DEBUG, "Pointer handle axis: axis: %d (0x%x)", axis, value);
     SWindowData *window_data = (SWindowData *) data;
-    if (axis == 0) {
-        window_data->mouse_wheel_y = -(value / 256.0f);
-        kCall(mouse_wheel_func, (mfb_key_mod) window_data->mod_keys, 0.0f, window_data->mouse_wheel_y);
+    SWindowData_Way *window_data_specific = window_data ? (SWindowData_Way *) window_data->specific : NULL;
+    if (window_data_specific == NULL) {
+        return;
     }
-    else if (axis == 1) {
-        window_data->mouse_wheel_x = -(value / 256.0f);
-        kCall(mouse_wheel_func, (mfb_key_mod) window_data->mod_keys, window_data->mouse_wheel_x, 0.0f);
+
+    float delta = -(float) wl_fixed_to_double(value);
+
+    if (pointer_uses_frame_events(pointer) == false) {
+        if (axis == WL_POINTER_AXIS_VERTICAL_SCROLL) {
+            window_data->mouse_wheel_y = delta;
+            kCall(mouse_wheel_func, (mfb_key_mod) window_data->mod_keys, 0.0f, delta);
+        }
+        else if (axis == WL_POINTER_AXIS_HORIZONTAL_SCROLL) {
+            window_data->mouse_wheel_x = delta;
+            kCall(mouse_wheel_func, (mfb_key_mod) window_data->mod_keys, delta, 0.0f);
+        }
+        return;
     }
+
+    SWaylandPointerAxisFrame *axis_frame = &window_data_specific->pointer_axis_frame;
+    if (axis == WL_POINTER_AXIS_VERTICAL_SCROLL) {
+        axis_frame->continuous_y += delta;
+    }
+    else if (axis == WL_POINTER_AXIS_HORIZONTAL_SCROLL) {
+        axis_frame->continuous_x += delta;
+    }
+    else {
+        return;
+    }
+    axis_frame->pending = 1;
 }
 
 #if defined(WL_POINTER_FRAME_SINCE_VERSION)
 
 //-------------------------------------
 static void
-frame(void *data, struct wl_pointer *pointer) {
-    kUnused(data);
+pointer_frame(void *data, struct wl_pointer *pointer) {
     kUnused(pointer);
+
+    SWindowData *window_data = (SWindowData *) data;
+    SWindowData_Way *window_data_specific = window_data ? (SWindowData_Way *) window_data->specific : NULL;
+    if (window_data_specific == NULL) {
+        return;
+    }
+
+    SWaylandPointerAxisFrame *axis_frame = &window_data_specific->pointer_axis_frame;
+    if (axis_frame->pending == 0) {
+        return;
+    }
+
+    float delta_x = (float) axis_frame->continuous_x;
+    float delta_y = (float) axis_frame->continuous_y;
+
+    if (axis_frame->value120_x_valid != 0) {
+        delta_x = (float) axis_frame->value120_x / 120.0f;
+    }
+    else if (axis_frame->discrete_x_valid != 0) {
+        delta_x = (float) axis_frame->discrete_x;
+    }
+
+    if (axis_frame->value120_y_valid != 0) {
+        delta_y = (float) axis_frame->value120_y / 120.0f;
+    }
+    else if (axis_frame->discrete_y_valid != 0) {
+        delta_y = (float) axis_frame->discrete_y;
+    }
+
+    window_data->mouse_wheel_x = delta_x;
+    window_data->mouse_wheel_y = delta_y;
+    kCall(mouse_wheel_func, (mfb_key_mod) window_data->mod_keys, delta_x, delta_y);
+
+    clear_pointer_axis_frame(window_data_specific);
 }
 
 #endif
@@ -1514,10 +1319,27 @@ axis_stop(void *data, struct wl_pointer *pointer, uint32_t time, uint32_t axis) 
 //-------------------------------------
 static void
 axis_discrete(void *data, struct wl_pointer *pointer, uint32_t axis, int32_t discrete) {
-    kUnused(data);
     kUnused(pointer);
-    kUnused(axis);
-    kUnused(discrete);
+
+    SWindowData *window_data = (SWindowData *) data;
+    SWindowData_Way *window_data_specific = window_data ? (SWindowData_Way *) window_data->specific : NULL;
+    if (window_data_specific == NULL) {
+        return;
+    }
+
+    SWaylandPointerAxisFrame *axis_frame = &window_data_specific->pointer_axis_frame;
+    if (axis == WL_POINTER_AXIS_VERTICAL_SCROLL) {
+        axis_frame->discrete_y = -(int64_t) discrete;
+        axis_frame->discrete_y_valid = 1;
+    }
+    else if (axis == WL_POINTER_AXIS_HORIZONTAL_SCROLL) {
+        axis_frame->discrete_x = -(int64_t) discrete;
+        axis_frame->discrete_x_valid = 1;
+    }
+    else {
+        return;
+    }
+    axis_frame->pending = 1;
 }
 
 #endif
@@ -1525,15 +1347,32 @@ axis_discrete(void *data, struct wl_pointer *pointer, uint32_t axis, int32_t dis
 #if defined(WL_POINTER_AXIS_VALUE120_SINCE_VERSION)
 
 //-------------------------------------
-// High-resolution wheel scroll information.
-// Currently unused; MiniFB keeps handling scroll through axis/axis_discrete.
+// High-resolution wheel scroll information. A value of 120 is one logical
+// wheel step; multiple values in the same frame are accumulated.
 //-------------------------------------
 static void
 axis_value120(void *data, struct wl_pointer *pointer, uint32_t axis, int32_t value120) {
-    kUnused(data);
     kUnused(pointer);
-    kUnused(axis);
-    kUnused(value120);
+
+    SWindowData *window_data = (SWindowData *) data;
+    SWindowData_Way *window_data_specific = window_data ? (SWindowData_Way *) window_data->specific : NULL;
+    if (window_data_specific == NULL) {
+        return;
+    }
+
+    SWaylandPointerAxisFrame *axis_frame = &window_data_specific->pointer_axis_frame;
+    if (axis == WL_POINTER_AXIS_VERTICAL_SCROLL) {
+        axis_frame->value120_y -= (int64_t) value120;
+        axis_frame->value120_y_valid = 1;
+    }
+    else if (axis == WL_POINTER_AXIS_HORIZONTAL_SCROLL) {
+        axis_frame->value120_x -= (int64_t) value120;
+        axis_frame->value120_x_valid = 1;
+    }
+    else {
+        return;
+    }
+    axis_frame->pending = 1;
 }
 
 #endif
@@ -1563,7 +1402,7 @@ wl_pointer_listener pointer_listener = {
     .button        = pointer_button,
     .axis          = pointer_axis,
 #if defined(WL_POINTER_FRAME_SINCE_VERSION)
-    .frame         = frame,
+    .frame         = pointer_frame,
 #endif
 #if defined(WL_POINTER_AXIS_SOURCE_SINCE_VERSION)
     .axis_source   = axis_source,
@@ -1590,14 +1429,13 @@ seat_capabilities(void *data, struct wl_seat *seat, enum wl_seat_capability caps
     if ((caps & WL_SEAT_CAPABILITY_KEYBOARD) && !window_data_specific->keyboard) {
         window_data_specific->keyboard = wl_seat_get_keyboard(seat);
         if (window_data_specific->keyboard) {
-            wl_keyboard_add_listener(window_data_specific->keyboard, &keyboard_listener, window_data);
+            wl_keyboard_add_listener(window_data_specific->keyboard, &g_wayland_keyboard_listener, window_data);
         }
     }
 
     else if (!(caps & WL_SEAT_CAPABILITY_KEYBOARD) && window_data_specific->keyboard) {
-        wl_keyboard_destroy(window_data_specific->keyboard);
-        window_data_specific->keyboard = NULL;
-        reset_keyboard_state(window_data, window_data_specific);
+        release_keyboard(&window_data_specific->keyboard);
+        wayland_clear_keyboard_focus_state(window_data, window_data_specific);
     }
 
     if ((caps & WL_SEAT_CAPABILITY_POINTER) && !window_data_specific->pointer) {
@@ -1607,8 +1445,18 @@ seat_capabilities(void *data, struct wl_seat *seat, enum wl_seat_capability caps
         }
     }
     else if (!(caps & WL_SEAT_CAPABILITY_POINTER) && window_data_specific->pointer) {
-        wl_pointer_destroy(window_data_specific->pointer);
-        window_data_specific->pointer = NULL;
+        release_pointer(&window_data_specific->pointer);
+        invalidate_pointer_serial_state(window_data_specific);
+        clear_pointer_axis_frame(window_data_specific);
+
+        // Release any buttons still marked as pressed; otherwise getters would
+        // report them as held forever now that we won't receive release events.
+        for (uint32_t button = 0; button < MFB_MAX_MOUSE_BUTTONS; ++button) {
+            if (window_data->mouse_button_status[button] != 0) {
+                window_data->mouse_button_status[button] = 0;
+                kCall(mouse_btn_func, (mfb_mouse_button) button, (mfb_key_mod) window_data->mod_keys, false);
+            }
+        }
     }
 }
 
@@ -1678,6 +1526,7 @@ fractional_scale_preferred_scale(void *data, struct wp_fractional_scale_v1 *frac
         return;
     }
     window_data_specific->preferred_scale_120 = scale;
+    refresh_cursor_surface(window_data);
 }
 
 //-------------------------------------
@@ -1774,6 +1623,7 @@ output_scale(void *data, struct wl_output *output, int32_t factor) {
     window_data_specific->output_scales[idx] = scale;
     if (window_data_specific->output_entered[idx]) {
         recompute_output_scale(window_data_specific);
+        refresh_cursor_surface(window_data);
     }
 }
 
@@ -1835,6 +1685,7 @@ surface_enter(void *data, struct wl_surface *surface, struct wl_output *output) 
     if (idx >= 0) {
         window_data_specific->output_entered[idx] = 1;
         recompute_output_scale(window_data_specific);
+        refresh_cursor_surface(window_data);
     }
 }
 
@@ -1852,6 +1703,7 @@ surface_leave(void *data, struct wl_surface *surface, struct wl_output *output) 
     if (idx >= 0) {
         window_data_specific->output_entered[idx] = 0;
         recompute_output_scale(window_data_specific);
+        refresh_cursor_surface(window_data);
     }
 }
 
@@ -1930,10 +1782,6 @@ registry_global(void *data, struct wl_registry *registry, uint32_t id, char cons
         MFB_LOG(MFB_LOG_TRACE, "wl_shm: server=%u client=%u using=%u", version, client_version, use_version);
         if (window_data_specific->shm) {
             wl_shm_add_listener(window_data_specific->shm, &shm_listener, window_data);
-            window_data_specific->cursor_theme = wl_cursor_theme_load(NULL, 32, window_data_specific->shm);
-            if (window_data_specific->cursor_theme) {
-                window_data_specific->default_cursor = wl_cursor_theme_get_cursor(window_data_specific->cursor_theme, "left_ptr");
-            }
         }
     }
 
@@ -1972,7 +1820,7 @@ registry_global(void *data, struct wl_registry *registry, uint32_t id, char cons
                 window_data_specific->output_scales[idx] = 1;
             }
             else {
-                wl_output_destroy(output);
+                release_output(&output);
             }
         }
     }
@@ -2012,11 +1860,9 @@ registry_global_remove(void *data, struct wl_registry *registry, uint32_t name) 
 
     for (uint32_t i = 0; i < window_data_specific->output_count; ++i) {
         if (window_data_specific->output_ids[i] == name) {
-            struct wl_output *removed = window_data_specific->outputs[i];
-
             bool was_entered = window_data_specific->output_entered[i];
 
-            wl_output_destroy(removed);
+            release_output(&window_data_specific->outputs[i]);
 
             // Compact arrays by moving the last element into the gap
             uint32_t last = window_data_specific->output_count - 1;
@@ -2034,6 +1880,7 @@ registry_global_remove(void *data, struct wl_registry *registry, uint32_t name) 
 
             if (was_entered) {
                 recompute_output_scale(window_data_specific);
+                refresh_cursor_surface(window_data);
             }
             break;
         }
@@ -2212,11 +2059,12 @@ slot_destroy(SWaylandBufferSlot *slot) {
 
 //-------------------------------------
 // Rebuild a slot's pool+buffer if its dimensions are stale.
-// Each slot owns its own fd, mmap, and wl_shm_pool — no shared offsets.
+// Each slot owns its own fd, mmap, and wl_shm_pool - no shared offsets.
 // Returns true on success (or if no rebuild was needed).
 //-------------------------------------
 static bool
-slot_ensure_buffer(SWaylandBufferSlot *slot, SWindowData_Way *window_data_specific,
+slot_ensure_buffer(SWaylandBufferSlot *slot,
+                   SWindowData_Way *window_data_specific,
                    uint32_t surface_w, uint32_t surface_h) {
     if (slot->wl_buf != NULL
         && slot->width == surface_w
@@ -2661,7 +2509,7 @@ compute_presentation_metrics(const SWindowData *window_data,
         metrics->integer_scale = 1;
     }
 
-    // 4B: fractional HiDPI via wp_viewporter — takes priority over 4A.
+    // 4B: fractional HiDPI via wp_viewporter - takes priority over 4A.
     if (window_data_specific->viewport != NULL
         && window_data_specific->preferred_scale_120 > 0) {
         float fscale = (float) window_data_specific->preferred_scale_120 / 120.0f;
@@ -2729,7 +2577,9 @@ acquire_presentation_slot(SWindowData *window_data,
     *out_slot = NULL;
 
     // Dispatch render pending to process any buffer release events.
-    dispatch_render_pending(window_data);
+    if (dispatch_render_pending(window_data) == false) {
+        return WAYLAND_SLOT_ACQUIRE_ERROR;
+    }
 
     while (true) {
         int start = window_data_specific->front_slot;
@@ -2753,7 +2603,12 @@ acquire_presentation_slot(SWindowData *window_data,
             return WAYLAND_SLOT_ACQUIRE_OK;
         }
 
-        // All slots busy — block until a release event arrives.
+        // All slots busy - block until a release event arrives.
+        // Drain window_queue so xdg_toplevel.close / configure can break the wait.
+        if (dispatch_owned_non_blocking(window_data) == false) {
+            return WAYLAND_SLOT_ACQUIRE_ERROR;
+        }
+
         if (window_data->close == true) {
             return WAYLAND_SLOT_ACQUIRE_ERROR;
         }
@@ -2825,7 +2680,8 @@ present_presentation_buffer(SWindowData *window_data,
         }
     }
 
-    surface_damage(window_data_specific->surface_wrapper, window_data_specific->compositor_version,
+    surface_damage(window_data_specific->surface_wrapper,
+                   window_data_specific->compositor_version,
                    0, 0,
                    (int32_t) metrics->physical_surface_width,
                    (int32_t) metrics->physical_surface_height);
@@ -2859,12 +2715,13 @@ mfb_update_state
 mfb_update_ex(struct mfb_window *window, void *buffer, unsigned width, unsigned height) {
     uint32_t buffer_stride = 0;
     size_t buffer_total_bytes = 0;
-    if (window == NULL) {
-        MFB_LOG(MFB_LOG_ERROR, "WaylandMiniFB: mfb_update_ex called with a null window pointer.");
+    SWindowData *window_data;
+    SWindowData_Way *window_data_specific;
+
+    if (get_window_data(window, __func__, &window_data, &window_data_specific) == false) {
         return MFB_STATE_INVALID_WINDOW;
     }
 
-    SWindowData *window_data = (SWindowData *) window;
     if (window_data->close == true) {
         MFB_LOG(MFB_LOG_ERROR, "WaylandMiniFB: mfb_update_ex aborted because the window is marked for close.");
         destroy(window_data);
@@ -2881,17 +2738,16 @@ mfb_update_ex(struct mfb_window *window, void *buffer, unsigned width, unsigned 
         return MFB_STATE_INVALID_BUFFER;
     }
 
-    SWindowData_Way *window_data_specific = (SWindowData_Way *) window_data->specific;
-    if (window_data_specific == NULL) {
-        MFB_LOG(MFB_LOG_ERROR, "WaylandMiniFB: missing Wayland-specific window data during mfb_update_ex.");
-        return MFB_STATE_INVALID_WINDOW;
-    }
-
     if (window_data_specific->display == NULL
         || wl_display_get_error(window_data_specific->display) != 0) {
         MFB_LOG(MFB_LOG_ERROR, "WaylandMiniFB: invalid Wayland display state during mfb_update_ex.");
         return MFB_STATE_INTERNAL_ERROR;
     }
+
+    // Reset scroll deltas before this event pump so newly dispatched values
+    // remain observable after mfb_update_ex returns.
+    window_data->mouse_wheel_x = 0.0f;
+    window_data->mouse_wheel_y = 0.0f;
 
     // 1. Dispatch window events (input, resize, close) non-blocking.
     if (dispatch_owned_non_blocking(window_data) == false) {
@@ -2935,10 +2791,6 @@ mfb_update_ex(struct mfb_window *window, void *buffer, unsigned width, unsigned 
     EWaylandSlotAcquireStatus slot_status =
         acquire_presentation_slot(window_data, window_data_specific, &metrics, &active_slot);
 
-    // Always reset per-frame input state.
-    window_data->mouse_wheel_x = 0.0f;
-    window_data->mouse_wheel_y = 0.0f;
-
     if (slot_status != WAYLAND_SLOT_ACQUIRE_OK || active_slot == NULL) {
         if (window_data->close == true) {
             destroy(window_data);
@@ -2962,23 +2814,19 @@ mfb_update_ex(struct mfb_window *window, void *buffer, unsigned width, unsigned 
 //-------------------------------------
 mfb_update_state
 mfb_update_events(struct mfb_window *window) {
-    if (window == NULL) {
-        MFB_LOG(MFB_LOG_ERROR, "WaylandMiniFB: mfb_update_events called with a null window pointer.");
+    SWindowData *window_data;
+    SWindowData_Way *window_data_specific;
+
+    if (get_window_data(window, __func__, &window_data, &window_data_specific) == false) {
         return MFB_STATE_INVALID_WINDOW;
     }
 
-    SWindowData *window_data = (SWindowData *) window;
     if (window_data->close == true) {
         MFB_LOG(MFB_LOG_ERROR, "WaylandMiniFB: mfb_update_events aborted because the window is marked for close.");
         destroy(window_data);
         return MFB_STATE_EXIT;
     }
 
-    SWindowData_Way *window_data_specific = (SWindowData_Way *) window_data->specific;
-    if (window_data_specific == NULL) {
-        MFB_LOG(MFB_LOG_ERROR, "WaylandMiniFB: missing Wayland-specific window data during mfb_update_events.");
-        return MFB_STATE_INVALID_WINDOW;
-    }
     if (window_data_specific->display == NULL
         || wl_display_get_error(window_data_specific->display) != 0) {
         MFB_LOG(MFB_LOG_ERROR, "WaylandMiniFB: invalid Wayland display state during mfb_update_events.");
@@ -3011,21 +2859,16 @@ mfb_update_events(struct mfb_window *window) {
 //-------------------------------------
 bool
 mfb_wait_sync(struct mfb_window *window) {
-    if (window == NULL) {
-        MFB_LOG(MFB_LOG_ERROR, "WaylandMiniFB: mfb_wait_sync called with a null window pointer.");
+    SWindowData *window_data;
+    SWindowData_Way *window_data_specific;
+
+    if (get_window_data(window, __func__, &window_data, &window_data_specific) == false) {
         return false;
     }
 
-    SWindowData *window_data = (SWindowData *) window;
     if (window_data->close == true) {
         MFB_LOG(MFB_LOG_ERROR, "WaylandMiniFB: mfb_wait_sync aborted because the window is marked for close.");
         destroy(window_data);
-        return false;
-    }
-
-    SWindowData_Way *window_data_specific = (SWindowData_Way *) window_data->specific;
-    if (window_data_specific == NULL) {
-        MFB_LOG(MFB_LOG_ERROR, "WaylandMiniFB: mfb_wait_sync missing Wayland-specific window data.");
         return false;
     }
 
@@ -3051,6 +2894,11 @@ mfb_wait_sync(struct mfb_window *window) {
         MFB_LOG(MFB_LOG_ERROR, "WaylandMiniFB: mfb_wait_sync aborted after dispatch because the window is marked for close.");
         destroy(window_data);
         return false;
+    }
+
+    if (window_data->must_resize_context) {
+        window_data->must_resize_context = false;
+        kCall(resize_func, window_data->window_width, window_data->window_height);
     }
 
     // When hardware sync is active (frame callback provides timing) or
@@ -3088,6 +2936,11 @@ mfb_wait_sync(struct mfb_window *window) {
             MFB_LOG(MFB_LOG_ERROR, "WaylandMiniFB: mfb_wait_sync aborted during sync loop because the window is marked for close.");
             destroy(window_data);
             return false;
+        }
+
+        if (window_data->must_resize_context) {
+            window_data->must_resize_context = false;
+            kCall(resize_func, window_data->window_width, window_data->window_height);
         }
     }
 
@@ -3251,16 +3104,18 @@ mfb_set_viewport(struct mfb_window *window, unsigned offset_x, unsigned offset_y
 //-------------------------------------
 void
 mfb_set_title(struct mfb_window *window, const char *title) {
-    if (window == 0x0 || title == 0x0) {
+    SWindowData *window_data;
+    SWindowData_Way *window_data_specific;
+
+    if (title == NULL) {
         return;
     }
 
-    SWindowData *window_data = (SWindowData *) window;
-    SWindowData_Way *window_data_specific = (SWindowData_Way *) window_data->specific;
-    if (window_data_specific == 0x0) {
+    if (get_window_data(window, __func__, &window_data, &window_data_specific) == false) {
         return;
     }
 
+    kUnused(window_data);
     xdg_toplevel_set_title(window_data_specific->toplevel, title);
     wl_surface_commit(window_data_specific->surface);
 }
@@ -3306,15 +3161,10 @@ mfb_get_monitor_scale(struct mfb_window *window, float *scale_x, float *scale_y)
 //-------------------------------------
 void
 mfb_show_cursor(struct mfb_window *window, bool show) {
-    SWindowData *window_data = (SWindowData *) window;
-    if (window_data == NULL) {
-        MFB_LOG(MFB_LOG_ERROR, "WaylandMiniFB: mfb_show_cursor called with a null window pointer.");
-        return;
-    }
+    SWindowData *window_data;
+    SWindowData_Way *window_data_specific;
 
-    SWindowData_Way *window_data_specific = (SWindowData_Way *) window_data->specific;
-    if (window_data_specific == NULL) {
-        MFB_LOG(MFB_LOG_ERROR, "WaylandMiniFB: mfb_show_cursor missing Wayland-specific window data.");
+    if (get_window_data(window, __func__, &window_data, &window_data_specific) == false) {
         return;
     }
 
@@ -3332,29 +3182,6 @@ mfb_show_cursor(struct mfb_window *window, bool show) {
         return;
     }
 
-    uint32_t serial = window_data_specific->pointer_enter_serial;
-    if (show) {
-        struct wl_cursor *cursor = window_data_specific->default_cursor;
-        if (cursor == NULL || cursor->image_count == 0 || cursor_surface == NULL) {
-            MFB_LOG(MFB_LOG_ERROR, "WaylandMiniFB: default cursor data is incomplete (cursor=%p, image_count=%u, cursor_surface=%p).",
-                    (void *) cursor, cursor ? cursor->image_count : 0, (void *) cursor_surface);
-            return;
-        }
-
-        struct wl_cursor_image *cursor_image = cursor->images[0];
-        struct wl_buffer *cursor_image_buffer = wl_cursor_image_get_buffer(cursor_image);
-        if (cursor_image_buffer == NULL) {
-            MFB_LOG(MFB_LOG_ERROR, "WaylandMiniFB: wl_cursor_image_get_buffer returned NULL.");
-            return;
-        }
-
-        wl_pointer_set_cursor(pointer, serial, cursor_surface, cursor_image->hotspot_x, cursor_image->hotspot_y);
-        wl_surface_attach(cursor_surface, cursor_image_buffer, 0, 0);
-        surface_damage(cursor_surface, window_data_specific->compositor_version,
-                       0, 0, cursor_image->width, cursor_image->height);
-        wl_surface_commit(cursor_surface);
-    }
-    else {
-        wl_pointer_set_cursor(pointer, serial, NULL, 0, 0);
-    }
+    kUnused(cursor_surface);
+    refresh_cursor_surface(window_data);
 }
