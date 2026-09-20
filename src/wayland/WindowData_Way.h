@@ -3,6 +3,7 @@
 #include <MiniFB_enums.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <time.h>
 
 #define WAYLAND_MAX_OUTPUTS 16
 #define WAYLAND_BUFFER_SLOTS 3
@@ -39,10 +40,8 @@ struct xkb_compose_table;
 struct xkb_compose_state;
 
 typedef struct {
-    struct wl_shm_pool  *pool;
     struct wl_buffer    *wl_buf;
     uint32_t            *shm_ptr;       // mmap'd pointer for this slot
-    int                  fd;
     size_t               pool_size;
     unsigned             width;         // dimensions this wl_buf was created with
     unsigned             height;
@@ -64,12 +63,27 @@ typedef struct {
 } SWaylandPointerAxisFrame;
 
 typedef struct {
+    uint32_t width;
+    uint32_t height;
+    uint8_t  has_toplevel;
+    uint8_t  has_size;
+} SWaylandPendingConfigure;
+
+typedef struct {
     struct wl_display       *display;
     struct wl_registry      *registry;
     struct wl_compositor    *compositor;
     struct xdg_wm_base      *shell;
     struct wl_seat          *seat;
     struct wl_keyboard      *keyboard;
+
+    // Key repeat. repeat_key is the raw wl_keyboard key code (not mfb_key or
+    // the xkb keycode). repeat_rate_cps <= 0 means repeat is disabled.
+    int32_t                  repeat_rate_cps;
+    int32_t                  repeat_delay_ms;
+    uint32_t                 repeat_key;
+    struct timespec          repeat_deadline;
+    uint8_t                  repeat_active;
 
     struct wl_pointer       *pointer;
     struct wl_cursor_theme  *cursor_theme;
@@ -92,6 +106,7 @@ typedef struct {
     struct wp_fractional_scale_manager_v1 *fractional_scale_manager;
     struct wp_fractional_scale_v1 *fractional_scale;
     uint32_t                preferred_scale_120;
+    uint32_t                surface_preferred_scale;
     struct wp_viewporter    *viewporter;
     struct wp_viewport      *viewport;
     struct wl_output        *outputs[WAYLAND_MAX_OUTPUTS];
@@ -109,13 +124,25 @@ typedef struct {
     struct wl_surface       *surface_wrapper;
     struct xdg_surface      *shell_surface;
     struct xdg_toplevel     *toplevel;
+    SWaylandPendingConfigure pending_configure;
     struct zxdg_decoration_manager_v1 *decoration_manager;
     struct zxdg_toplevel_decoration_v1 *toplevel_decoration;
 
+    uint32_t                compositor_id;
+    uint32_t                shell_id;
+    uint32_t                seat_id;
+    uint32_t                shm_id;
+    uint32_t                fractional_scale_manager_id;
+    uint32_t                viewporter_id;
+    uint32_t                decoration_manager_id;
     uint32_t                compositor_version;
     uint32_t                seat_version;
     uint32_t                shm_format;
+    uint8_t                 backend_unusable;
     struct wl_callback      *throttle_callback;
+    int64_t                 throttle_deadline_seconds;
+    int32_t                 throttle_deadline_nanoseconds;
+    uint8_t                 throttle_deadline_valid;
     SWaylandBufferSlot      slots[WAYLAND_BUFFER_SLOTS];
     int                     front_slot;
 

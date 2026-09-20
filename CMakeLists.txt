@@ -92,8 +92,6 @@ set(SrcWayland
     src/wayland/generated/xdg-shell-client-protocol.h
     src/wayland/generated/xdg-decoration-protocol.c
     src/wayland/generated/xdg-decoration-client-protocol.h
-    src/wayland/generated/xdg-output-unstable-v1-protocol.c
-    src/wayland/generated/xdg-output-unstable-v1-client-protocol.h
     src/wayland/generated/fractional-scale-v1-protocol.c
     src/wayland/generated/fractional-scale-v1-client-protocol.h
     src/wayland/generated/viewporter-protocol.c
@@ -104,6 +102,8 @@ set(SrcWayland
     src/wayland/WaylandMiniFB_input_keyboard.h
     src/wayland/WindowData_Way.h
     src/MiniFB_linux.c
+    src/MiniFB_timespec.c
+    src/MiniFB_timespec.h
     src/MiniFB_utf8.c
     src/MiniFB_utf8.h
 )

@@ -17,6 +17,7 @@
 #include "generated/viewporter-client-protocol.h"
 #include "MiniFB_internal.h"
 #include "MiniFB_enums.h"
+#include "MiniFB_timespec.h"
 #include "WindowData.h"
 #include "WindowData_Way.h"
 #include "WaylandMiniFB_input_keyboard.h"
@@ -27,6 +28,7 @@
 #include <xkbcommon/xkbcommon-compose.h>
 
 #include <inttypes.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -40,6 +42,7 @@
 #include <linux/limits.h>
 #include <linux/input.h>
 #include <linux/input-event-codes.h>
+#include <linux/memfd.h>
 
 #include <sys/mman.h>
 
@@ -51,8 +54,67 @@
 #define MFB_STR_IMPL(x) #x
 #define MFB_STR(x) MFB_STR_IMPL(x)
 
-#define WAYLAND_FRACTIONAL_SCALE_DENOMINATOR 120.0f
+#define WAYLAND_FRACTIONAL_SCALE_DENOMINATOR 120u
+// Bound compositor-provided scales before they amplify SHM and cursor resources.
+#define WAYLAND_MAX_BUFFER_SCALE 10u
+#define WAYLAND_MAX_FRACTIONAL_SCALE_120 (WAYLAND_MAX_BUFFER_SCALE * WAYLAND_FRACTIONAL_SCALE_DENOMINATOR)
 #define WAYLAND_DEFAULT_CURSOR_SIZE 32
+#define WAYLAND_THROTTLE_DEADLINE_MS 100.0
+#define WAYLAND_THROTTLE_POLL_SLICE_MS (1000.0 / 60.0)
+
+// Core protocol interface descriptors come from the libwayland loaded at
+// runtime. Cap them to the requests and listener entries available in the
+// headers used to compile MiniFB, otherwise an older binary can bind events its
+// listener structs do not contain when run with a newer libwayland.
+#if defined(WL_SURFACE_PREFERRED_BUFFER_SCALE_SINCE_VERSION)
+    #define WAYLAND_COMPILED_COMPOSITOR_VERSION WL_SURFACE_PREFERRED_BUFFER_SCALE_SINCE_VERSION
+#elif defined(WL_SURFACE_OFFSET_SINCE_VERSION)
+    #define WAYLAND_COMPILED_COMPOSITOR_VERSION WL_SURFACE_OFFSET_SINCE_VERSION
+#elif defined(WL_SURFACE_DAMAGE_BUFFER_SINCE_VERSION)
+    #define WAYLAND_COMPILED_COMPOSITOR_VERSION WL_SURFACE_DAMAGE_BUFFER_SINCE_VERSION
+#elif defined(WL_SURFACE_SET_BUFFER_SCALE_SINCE_VERSION)
+    #define WAYLAND_COMPILED_COMPOSITOR_VERSION WL_SURFACE_SET_BUFFER_SCALE_SINCE_VERSION
+#elif defined(WL_SURFACE_SET_BUFFER_TRANSFORM_SINCE_VERSION)
+    #define WAYLAND_COMPILED_COMPOSITOR_VERSION WL_SURFACE_SET_BUFFER_TRANSFORM_SINCE_VERSION
+#else
+    #define WAYLAND_COMPILED_COMPOSITOR_VERSION 1u
+#endif
+
+#if defined(WL_KEYBOARD_KEY_STATE_REPEATED_SINCE_VERSION)
+    #define WAYLAND_COMPILED_SEAT_VERSION WL_KEYBOARD_KEY_STATE_REPEATED_SINCE_VERSION
+#elif defined(WL_POINTER_AXIS_RELATIVE_DIRECTION_SINCE_VERSION)
+    #define WAYLAND_COMPILED_SEAT_VERSION WL_POINTER_AXIS_RELATIVE_DIRECTION_SINCE_VERSION
+#elif defined(WL_POINTER_AXIS_VALUE120_SINCE_VERSION)
+    #define WAYLAND_COMPILED_SEAT_VERSION WL_POINTER_AXIS_VALUE120_SINCE_VERSION
+#elif defined(WL_POINTER_AXIS_SOURCE_WHEEL_TILT_SINCE_VERSION)
+    #define WAYLAND_COMPILED_SEAT_VERSION WL_POINTER_AXIS_SOURCE_WHEEL_TILT_SINCE_VERSION
+#elif defined(WL_POINTER_FRAME_SINCE_VERSION)
+    #define WAYLAND_COMPILED_SEAT_VERSION WL_POINTER_FRAME_SINCE_VERSION
+#elif defined(WL_KEYBOARD_REPEAT_INFO_SINCE_VERSION)
+    #define WAYLAND_COMPILED_SEAT_VERSION WL_KEYBOARD_REPEAT_INFO_SINCE_VERSION
+#elif defined(WL_POINTER_RELEASE_SINCE_VERSION)
+    #define WAYLAND_COMPILED_SEAT_VERSION WL_POINTER_RELEASE_SINCE_VERSION
+#elif defined(WL_SEAT_NAME_SINCE_VERSION)
+    #define WAYLAND_COMPILED_SEAT_VERSION WL_SEAT_NAME_SINCE_VERSION
+#else
+    #define WAYLAND_COMPILED_SEAT_VERSION 1u
+#endif
+
+#if defined(WL_OUTPUT_NAME_SINCE_VERSION)
+    #define WAYLAND_COMPILED_OUTPUT_VERSION WL_OUTPUT_NAME_SINCE_VERSION
+#elif defined(WL_OUTPUT_RELEASE_SINCE_VERSION)
+    #define WAYLAND_COMPILED_OUTPUT_VERSION WL_OUTPUT_RELEASE_SINCE_VERSION
+#elif defined(WL_OUTPUT_SCALE_SINCE_VERSION)
+    #define WAYLAND_COMPILED_OUTPUT_VERSION WL_OUTPUT_SCALE_SINCE_VERSION
+#else
+    #define WAYLAND_COMPILED_OUTPUT_VERSION 1u
+#endif
+
+#if defined(WL_SHM_RELEASE_SINCE_VERSION)
+    #define WAYLAND_COMPILED_SHM_VERSION WL_SHM_RELEASE_SINCE_VERSION
+#else
+    #define WAYLAND_COMPILED_SHM_VERSION 1u
+#endif
 
 //-------------------------------------
 void init_keycodes();
@@ -62,6 +124,40 @@ void init_keycodes();
 static void slot_destroy(SWaylandBufferSlot *slot);
 static bool slot_ensure_buffer(SWaylandBufferSlot *slot, SWindowData_Way *window_data_specific, uint32_t surface_w, uint32_t surface_h);
 static void clear_pointer_axis_frame(SWindowData_Way *window_data_specific);
+
+//-------------------------------------
+static uint32_t
+negotiate_protocol_version(uint32_t server_version, const struct wl_interface *interface, uint32_t compiled_version) {
+    uint32_t runtime_version = (uint32_t) interface->version;
+    uint32_t use_version = server_version;
+
+    if (use_version > runtime_version) {
+        use_version = runtime_version;
+    }
+    if (use_version > compiled_version) {
+        use_version = compiled_version;
+    }
+
+    MFB_LOG(MFB_LOG_TRACE,
+            "%s: server=%u runtime=%u compiled=%u using=%u",
+            interface->name,
+            server_version,
+            runtime_version,
+            compiled_version,
+            use_version
+    );
+
+    return use_version;
+}
+
+//-------------------------------------
+#define kWaylandDestroy(field, destructor)  \
+    do {                                    \
+        if ((field) != NULL) {              \
+            destructor(field);              \
+            (field) = NULL;                 \
+        }                                   \
+    } while (0)
 
 //-------------------------------------
 static void
@@ -140,6 +236,25 @@ release_seat(struct wl_seat **seat) {
 }
 
 //-------------------------------------
+static void
+release_shm(struct wl_shm **shm) {
+    if (shm == NULL || *shm == NULL) {
+        return;
+    }
+
+#if defined(WL_SHM_RELEASE_SINCE_VERSION)
+    if (wl_proxy_get_version((struct wl_proxy *) *shm) >= WL_SHM_RELEASE_SINCE_VERSION) {
+        wl_shm_release(*shm);
+        *shm = NULL;
+        return;
+    }
+#endif
+
+    wl_shm_destroy(*shm);
+    *shm = NULL;
+}
+
+//-------------------------------------
 static inline void
 surface_damage(struct wl_surface *surface,
                uint32_t compositor_version,
@@ -152,7 +267,13 @@ surface_damage(struct wl_surface *surface,
         return;
     }
 #endif
-    wl_surface_damage(surface, x, y, w, h);
+    // Legacy wl_surface.damage takes surface-local coordinates while callers
+    // pass buffer coordinates, so invalidate the whole surface instead.
+    kUnused(x);
+    kUnused(y);
+    kUnused(w);
+    kUnused(h);
+    wl_surface_damage(surface, 0, 0, INT32_MAX, INT32_MAX);
 }
 
 //-------------------------------------
@@ -185,65 +306,17 @@ extern double g_time_for_frame;
 //   window_queue  - shell, input, output, decoration events
 //   render_queue  - buffer release, frame callback, sync callback events
 //
-// This separation prevents input callbacks from firing during blocking waits
-// for frame presentation, which would otherwise cause re-entrant updates or
-// stalls when the compositor holds buffers.
+// This separation preserves ordering between presentation and window state
+// while allowing waits to target the queue that can satisfy them. Wait paths
+// still drain both owned queues so input, close, and configure events are not
+// delayed behind presentation callbacks.
 //-------------------------------------
-
-//-------------------------------------
-static void
-ts_add(struct timespec *out, const struct timespec *a, const struct timespec *b) {
-    out->tv_sec = a->tv_sec + b->tv_sec;
-    out->tv_nsec = a->tv_nsec + b->tv_nsec;
-
-    if (out->tv_nsec >= 1000000000L) {
-        out->tv_sec += 1;
-        out->tv_nsec -= 1000000000L;
-    }
-}
-
-//-------------------------------------
-static void
-ts_sub_sat(struct timespec *out, const struct timespec *a, const struct timespec *b) {
-    out->tv_sec = a->tv_sec - b->tv_sec;
-    out->tv_nsec = a->tv_nsec - b->tv_nsec;
-
-    if (out->tv_nsec < 0) {
-        out->tv_sec -= 1;
-        out->tv_nsec += 1000000000L;
-    }
-
-    if (out->tv_sec < 0) {
-        out->tv_sec = 0;
-        out->tv_nsec = 0;
-    }
-}
-
-//-------------------------------------
-static struct timespec
-ms_to_ts(double ms) {
-    struct timespec out = { 0, 0 };
-
-    if (ms <= 0.0) {
-        return out;
-    }
-
-    out.tv_sec = (time_t) (ms / 1000.0);
-    out.tv_nsec = (long) ((ms - ((double) out.tv_sec * 1000.0)) * 1000000.0);
-
-    if (out.tv_nsec >= 1000000000L) {
-        out.tv_sec += out.tv_nsec / 1000000000L;
-        out.tv_nsec %= 1000000000L;
-    }
-
-    return out;
-}
 
 //-------------------------------------
 static int
 poll_display_fd(struct wl_display *display, short events, const struct timespec *timeout) {
     struct pollfd pfd;
-    struct timespec now;
+    struct timespec now = { 0, 0 };
     struct timespec deadline = { 0, 0 };
     struct timespec remaining;
     const struct timespec *effective_timeout = timeout;
@@ -251,7 +324,7 @@ poll_display_fd(struct wl_display *display, short events, const struct timespec 
 
     if (timeout != NULL) {
         clock_gettime(CLOCK_MONOTONIC, &now);
-        ts_add(&deadline, &now, timeout);
+        deadline = ts_add(now, *timeout);
     }
 
     pfd.fd = wl_display_get_fd(display);
@@ -261,7 +334,7 @@ poll_display_fd(struct wl_display *display, short events, const struct timespec 
     do {
         if (timeout != NULL) {
             clock_gettime(CLOCK_MONOTONIC, &now);
-            ts_sub_sat(&remaining, &deadline, &now);
+            remaining = ts_sub_sat(deadline, now);
             effective_timeout = &remaining;
         }
 
@@ -281,6 +354,16 @@ flush_display(struct wl_display *display) {
     }
 
     return true;
+}
+
+//-------------------------------------
+static void
+flush_request(struct wl_display *display, const char *request_name) {
+    if (flush_display(display) == false) {
+        int error_code = errno;
+        MFB_LOG(MFB_LOG_ERROR, "WaylandMiniFB: failed to flush %s: %s (%d).",
+                request_name, strerror(error_code), error_code);
+    }
 }
 
 //-------------------------------------
@@ -341,7 +424,8 @@ dispatch_queue_timeout(SWindowData *window_data,
                        struct wl_event_queue *read_queue,
                        const struct timespec *timeout) {
     SWindowData_Way *window_data_specific = (SWindowData_Way *) window_data->specific;
-    struct timespec now;
+    struct wl_event_queue *other_queue;
+    struct timespec now = { 0, 0 };
     struct timespec deadline = { 0, 0 };
     struct timespec remaining = { 0, 0 };
     const struct timespec *timeout_ptr = NULL;
@@ -354,9 +438,19 @@ dispatch_queue_timeout(SWindowData *window_data,
         return false;
     }
 
+    if (read_queue == window_data_specific->window_queue) {
+        other_queue = window_data_specific->render_queue;
+    }
+    else if (read_queue == window_data_specific->render_queue) {
+        other_queue = window_data_specific->window_queue;
+    }
+    else {
+        return false;
+    }
+
     if (timeout != NULL) {
         clock_gettime(CLOCK_MONOTONIC, &now);
-        ts_add(&deadline, &now, timeout);
+        deadline = ts_add(now, *timeout);
     }
 
     if (wl_display_prepare_read_queue(window_data_specific->display, read_queue) == -1) {
@@ -372,7 +466,7 @@ dispatch_queue_timeout(SWindowData *window_data,
 
         if (timeout != NULL) {
             clock_gettime(CLOCK_MONOTONIC, &now);
-            ts_sub_sat(&remaining, &deadline, &now);
+            remaining = ts_sub_sat(deadline, now);
             timeout_ptr = &remaining;
         }
         else {
@@ -399,7 +493,7 @@ dispatch_queue_timeout(SWindowData *window_data,
     while (true) {
         if (timeout != NULL) {
             clock_gettime(CLOCK_MONOTONIC, &now);
-            ts_sub_sat(&remaining, &deadline, &now);
+            remaining = ts_sub_sat(deadline, now);
             timeout_ptr = &remaining;
         }
         else {
@@ -420,6 +514,17 @@ dispatch_queue_timeout(SWindowData *window_data,
         }
 
         result = dispatch_queue_pending_count(window_data, read_queue);
+        if (result < 0) {
+            return false;
+        }
+
+        if (result != 0) {
+            return true;
+        }
+
+        // A display read can enqueue events on either owned queue. Do not
+        // block again while the other queue has callbacks ready to dispatch.
+        result = dispatch_queue_pending_count(window_data, other_queue);
         if (result < 0) {
             return false;
         }
@@ -559,10 +664,10 @@ dispatch_render_blocking(SWindowData *window_data) {
 //-------------------------------------
 // Throttle infrastructure.
 //
-// surface_throttle() waits for the PREVIOUS frame's callback before starting
-// the next frame. This is the key difference from the old inline-wait pattern:
-// the CPU can prepare the next frame while the compositor presents the current
-// one (pipelined rendering).
+// surface_throttle_wait() waits briefly for the PREVIOUS frame's callback.
+// If the compositor keeps a committed callback pending (for example while the
+// surface is minimized), the current update is skipped after an absolute
+// per-callback deadline instead of blocking the application's main loop.
 //
 // g_use_wayland_frame_callback_throttle controls whether wl_surface_frame is
 // used (vsync-like) or skipped (mailbox-style, throttled only by wl_display_sync).
@@ -580,8 +685,12 @@ throttle_done(void *data, struct wl_callback *callback, uint32_t time) {
 
     kUnused(time);
 
-    if (window_data_specific != NULL) {
+    if (window_data_specific != NULL
+        && window_data_specific->throttle_callback == callback) {
         window_data_specific->throttle_callback = NULL;
+        window_data_specific->throttle_deadline_seconds = 0;
+        window_data_specific->throttle_deadline_nanoseconds = 0;
+        window_data_specific->throttle_deadline_valid = 0;
     }
 
     wl_callback_destroy(callback);
@@ -594,39 +703,120 @@ wl_callback_listener g_throttle_listener = {
 };
 
 //-------------------------------------
+typedef enum {
+    WAYLAND_THROTTLE_READY = 0,
+    WAYLAND_THROTTLE_SKIP,
+    WAYLAND_THROTTLE_ERROR,
+} EWaylandThrottleStatus;
+
+//-------------------------------------
 static bool
-surface_throttle(SWindowData *window_data) {
+make_throttle_deadline(struct timespec *deadline) {
+    struct timespec now;
+    struct timespec timeout = ms_to_ts(WAYLAND_THROTTLE_DEADLINE_MS);
+
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
+        return false;
+    }
+
+    *deadline = ts_add(now, timeout);
+    return true;
+}
+
+//-------------------------------------
+static EWaylandThrottleStatus
+surface_throttle_wait(SWindowData *window_data) {
     SWindowData_Way *window_data_specific = (SWindowData_Way *) window_data->specific;
 
-    if (window_data_specific->surface_wrapper == NULL) {
-        return false;
+    if (window_data_specific->surface_wrapper == NULL
+        || window_data_specific->render_queue == NULL) {
+        return WAYLAND_THROTTLE_ERROR;
     }
 
     while (window_data_specific->throttle_callback != NULL) {
-        // Drain window_queue so xdg_toplevel.close / configure can break the wait.
+        // Drain both queues so done, close and configure events can break the wait.
         if (dispatch_owned_non_blocking(window_data) == false) {
-            return false;
+            return WAYLAND_THROTTLE_ERROR;
         }
 
-        if (window_data->close == true) {
-            return false;
+        if (window_data->close == true
+            || window_data_specific->backend_unusable != 0) {
+            return WAYLAND_THROTTLE_ERROR;
         }
 
-        if (dispatch_render_blocking(window_data) == false) {
-            return false;
+        if (window_data_specific->throttle_callback == NULL) {
+            return WAYLAND_THROTTLE_READY;
+        }
+
+        if (window_data_specific->throttle_deadline_valid == 0) {
+            return WAYLAND_THROTTLE_ERROR;
+        }
+
+        struct timespec now;
+        if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
+            return WAYLAND_THROTTLE_ERROR;
+        }
+
+        struct timespec deadline = {
+            .tv_sec = (time_t) window_data_specific->throttle_deadline_seconds,
+            .tv_nsec = (long) window_data_specific->throttle_deadline_nanoseconds,
+        };
+        struct timespec remaining;
+        remaining = ts_sub_sat(deadline, now);
+        if (ts_is_zero(remaining) == true) {
+            return WAYLAND_THROTTLE_SKIP;
+        }
+
+        struct timespec poll_slice = ms_to_ts(WAYLAND_THROTTLE_POLL_SLICE_MS);
+        if (ts_is_less(remaining, poll_slice) == true) {
+            poll_slice = remaining;
+        }
+
+        if (dispatch_queue_timeout(window_data,
+                                   window_data_specific->render_queue,
+                                   &poll_slice) == false) {
+            return WAYLAND_THROTTLE_ERROR;
         }
     }
 
-    if (g_use_wayland_frame_callback_throttle == false) {
-        return true;
-    }
+    return WAYLAND_THROTTLE_READY;
+}
 
-    window_data_specific->throttle_callback = wl_surface_frame(window_data_specific->surface_wrapper);
-    if (window_data_specific->throttle_callback == NULL) {
+//-------------------------------------
+// Requests the throttle signal for the frame about to be committed. Must be
+// called after all fallible buffer work has completed, and immediately
+// before the commit that makes a requested frame callback effective.
+//
+// When frame callback throttling is enabled, requests wl_surface_frame and
+// stores its deadline. Otherwise, only computes the deadline that the
+// caller must apply to a wl_display_sync fallback requested after the
+// commit.
+//-------------------------------------
+static bool
+surface_throttle_request(SWindowData_Way *window_data_specific, struct timespec *out_deadline) {
+    if (g_use_wayland_frame_callback_throttle == true) {
+        if (make_throttle_deadline(out_deadline) == false) {
+            MFB_LOG(MFB_LOG_ERROR, "WaylandMiniFB: failed to create a frame throttle deadline.");
+            return false;
+        }
+
+        window_data_specific->throttle_callback = wl_surface_frame(window_data_specific->surface_wrapper);
+        if (window_data_specific->throttle_callback == NULL) {
+            MFB_LOG(MFB_LOG_ERROR, "WaylandMiniFB: wl_surface_frame returned NULL.");
+            return false;
+        }
+
+        window_data_specific->throttle_deadline_seconds = (int64_t) out_deadline->tv_sec;
+        window_data_specific->throttle_deadline_nanoseconds = (int32_t) out_deadline->tv_nsec;
+        window_data_specific->throttle_deadline_valid = 1;
+        wl_callback_add_listener(window_data_specific->throttle_callback,
+                                 &g_throttle_listener, window_data_specific);
+    }
+    else if (make_throttle_deadline(out_deadline) == false) {
+        MFB_LOG(MFB_LOG_ERROR, "WaylandMiniFB: failed to create a sync throttle deadline.");
         return false;
     }
 
-    wl_callback_add_listener(window_data_specific->throttle_callback, &g_throttle_listener, window_data_specific);
     return true;
 }
 
@@ -642,30 +832,17 @@ destroy_window_data(SWindowData *window_data) {
 
     SWindowData_Way   *window_data_specific = (SWindowData_Way *) window_data->specific;
     if (window_data_specific != NULL) {
-        // Destroy all buffer slots (pool, buffer, mmap, fd per slot).
+        // Destroy the wl_buffer objects and mapped memory owned by the slots.
         for (int i = 0; i < WAYLAND_BUFFER_SLOTS; ++i) {
             slot_destroy(&window_data_specific->slots[i]);
         }
 
-        if (window_data_specific->xkb_compose_state) {
-            xkb_compose_state_unref(window_data_specific->xkb_compose_state);
-        }
-
-        if (window_data_specific->xkb_compose_table) {
-            xkb_compose_table_unref(window_data_specific->xkb_compose_table);
-        }
-
-        if (window_data_specific->xkb_state) {
-            xkb_state_unref(window_data_specific->xkb_state);
-        }
-
-        if (window_data_specific->xkb_keymap) {
-            xkb_keymap_unref(window_data_specific->xkb_keymap);
-        }
-
-        if (window_data_specific->xkb_context) {
-            xkb_context_unref(window_data_specific->xkb_context);
-        }
+        // xkbcommon objects are refcounted, so these unref instead of destroy.
+        kWaylandDestroy(window_data_specific->xkb_compose_state, xkb_compose_state_unref);
+        kWaylandDestroy(window_data_specific->xkb_compose_table, xkb_compose_table_unref);
+        kWaylandDestroy(window_data_specific->xkb_state,         xkb_state_unref);
+        kWaylandDestroy(window_data_specific->xkb_keymap,        xkb_keymap_unref);
+        kWaylandDestroy(window_data_specific->xkb_context,       xkb_context_unref);
 
         mfb_timer_destroy(window_data_specific->timer);
         memset(window_data_specific, 0, sizeof(SWindowData_Way));
@@ -691,82 +868,31 @@ destroy(SWindowData *window_data) {
 
     // Destroy protocol objects before disconnecting the display.
     // Order: extensions first, then core objects, then connection.
+    // Surface extensions and shell children must go before the surface and the
+    // xdg_wm_base they were created from.
 
-    if (window_data_specific->toplevel_decoration) {
-        zxdg_toplevel_decoration_v1_destroy(window_data_specific->toplevel_decoration);
-        window_data_specific->toplevel_decoration = NULL;
-    }
-
-    if (window_data_specific->toplevel) {
-        xdg_toplevel_destroy(window_data_specific->toplevel);
-        window_data_specific->toplevel = NULL;
-    }
-
-    if (window_data_specific->shell_surface) {
-        xdg_surface_destroy(window_data_specific->shell_surface);
-        window_data_specific->shell_surface = NULL;
-    }
-
-    if (window_data_specific->shell) {
-        xdg_wm_base_destroy(window_data_specific->shell);
-        window_data_specific->shell = NULL;
-    }
-
-    if (window_data_specific->decoration_manager) {
-        zxdg_decoration_manager_v1_destroy(window_data_specific->decoration_manager);
-        window_data_specific->decoration_manager = NULL;
-    }
-
-    if (window_data_specific->fractional_scale) {
-        wp_fractional_scale_v1_destroy(window_data_specific->fractional_scale);
-        window_data_specific->fractional_scale = NULL;
-    }
-
-    if (window_data_specific->fractional_scale_manager) {
-        wp_fractional_scale_manager_v1_destroy(window_data_specific->fractional_scale_manager);
-        window_data_specific->fractional_scale_manager = NULL;
-    }
-
-    if (window_data_specific->viewport) {
-        wp_viewport_destroy(window_data_specific->viewport);
-        window_data_specific->viewport = NULL;
-    }
-
-    if (window_data_specific->viewporter) {
-        wp_viewporter_destroy(window_data_specific->viewporter);
-        window_data_specific->viewporter = NULL;
-    }
-
-    if (window_data_specific->throttle_callback) {
-        wl_callback_destroy(window_data_specific->throttle_callback);
-        window_data_specific->throttle_callback = NULL;
-    }
-
-    if (window_data_specific->surface_wrapper) {
-        wl_proxy_wrapper_destroy(window_data_specific->surface_wrapper);
-        window_data_specific->surface_wrapper = NULL;
-    }
-
-    if (window_data_specific->surface) {
-        wl_surface_destroy(window_data_specific->surface);
-        window_data_specific->surface = NULL;
-    }
+    kWaylandDestroy(window_data_specific->toplevel_decoration,     zxdg_toplevel_decoration_v1_destroy);
+    kWaylandDestroy(window_data_specific->toplevel,                xdg_toplevel_destroy);
+    kWaylandDestroy(window_data_specific->shell_surface,           xdg_surface_destroy);
+    kWaylandDestroy(window_data_specific->shell,                   xdg_wm_base_destroy);
+    kWaylandDestroy(window_data_specific->decoration_manager,      zxdg_decoration_manager_v1_destroy);
+    kWaylandDestroy(window_data_specific->fractional_scale,        wp_fractional_scale_v1_destroy);
+    kWaylandDestroy(window_data_specific->fractional_scale_manager, wp_fractional_scale_manager_v1_destroy);
+    kWaylandDestroy(window_data_specific->viewport,                wp_viewport_destroy);
+    kWaylandDestroy(window_data_specific->viewporter,              wp_viewporter_destroy);
+    kWaylandDestroy(window_data_specific->throttle_callback,       wl_callback_destroy);
+    kWaylandDestroy(window_data_specific->surface_wrapper,         wl_proxy_wrapper_destroy);
+    kWaylandDestroy(window_data_specific->surface,                 wl_surface_destroy);
 
     // Destroy all buffer slots (protocol objects + resources) before display disconnect.
     for (int i = 0; i < WAYLAND_BUFFER_SLOTS; ++i) {
         slot_destroy(&window_data_specific->slots[i]);
     }
 
-    if (window_data_specific->cursor_surface) {
-        wl_surface_destroy(window_data_specific->cursor_surface);
-        window_data_specific->cursor_surface = NULL;
-    }
+    kWaylandDestroy(window_data_specific->cursor_surface, wl_surface_destroy);
 
     for (uint32_t i = 0; i < window_data_specific->cursor_theme_cache_count; ++i) {
-        if (window_data_specific->cursor_theme_cache[i]) {
-            wl_cursor_theme_destroy(window_data_specific->cursor_theme_cache[i]);
-            window_data_specific->cursor_theme_cache[i] = NULL;
-        }
+        kWaylandDestroy(window_data_specific->cursor_theme_cache[i], wl_cursor_theme_destroy);
         window_data_specific->default_cursor_cache[i] = NULL;
         window_data_specific->cursor_theme_cache_scales[i] = 0;
     }
@@ -775,67 +901,33 @@ destroy(SWindowData *window_data) {
     window_data_specific->default_cursor = NULL;
     window_data_specific->cursor_theme_scale = 0;
 
-    if (window_data_specific->shm) {
-        wl_shm_destroy(window_data_specific->shm);
-        window_data_specific->shm = NULL;
-    }
+    release_shm(&window_data_specific->shm);
 
+    // The release_* helpers already ignore a null field, so they need no guard.
     for (uint32_t i = 0; i < window_data_specific->output_count; ++i) {
-        if (window_data_specific->outputs[i]) {
-            release_output(&window_data_specific->outputs[i]);
-        }
+        release_output(&window_data_specific->outputs[i]);
     }
 
     window_data_specific->output_count = 0;
     window_data_specific->integer_output_scale = 1;
 
-    if (window_data_specific->compositor) {
-        wl_compositor_destroy(window_data_specific->compositor);
-        window_data_specific->compositor = NULL;
-    }
+    kWaylandDestroy(window_data_specific->compositor, wl_compositor_destroy);
 
-    if (window_data_specific->keyboard) {
-        release_keyboard(&window_data_specific->keyboard);
-    }
+    release_keyboard(&window_data_specific->keyboard);
 
-    if (window_data_specific->pointer) {
+    if (window_data_specific->pointer != NULL) {
         clear_pointer_axis_frame(window_data_specific);
         release_pointer(&window_data_specific->pointer);
     }
 
-    if (window_data_specific->seat) {
-        release_seat(&window_data_specific->seat);
-    }
+    release_seat(&window_data_specific->seat);
 
-    if (window_data_specific->registry) {
-        wl_registry_destroy(window_data_specific->registry);
-        window_data_specific->registry = NULL;
-    }
-
-    if (window_data_specific->window_display_wrapper) {
-        wl_proxy_wrapper_destroy(window_data_specific->window_display_wrapper);
-        window_data_specific->window_display_wrapper = NULL;
-    }
-
-    if (window_data_specific->render_display_wrapper) {
-        wl_proxy_wrapper_destroy(window_data_specific->render_display_wrapper);
-        window_data_specific->render_display_wrapper = NULL;
-    }
-
-    if (window_data_specific->render_queue) {
-        wl_event_queue_destroy(window_data_specific->render_queue);
-        window_data_specific->render_queue = NULL;
-    }
-
-    if (window_data_specific->window_queue) {
-        wl_event_queue_destroy(window_data_specific->window_queue);
-        window_data_specific->window_queue = NULL;
-    }
-
-    if (window_data_specific->display) {
-        wl_display_disconnect(window_data_specific->display);
-        window_data_specific->display = NULL;
-    }
+    kWaylandDestroy(window_data_specific->registry,               wl_registry_destroy);
+    kWaylandDestroy(window_data_specific->window_display_wrapper, wl_proxy_wrapper_destroy);
+    kWaylandDestroy(window_data_specific->render_display_wrapper, wl_proxy_wrapper_destroy);
+    kWaylandDestroy(window_data_specific->render_queue,           wl_event_queue_destroy);
+    kWaylandDestroy(window_data_specific->window_queue,           wl_event_queue_destroy);
+    kWaylandDestroy(window_data_specific->display,                wl_display_disconnect);
 
     destroy_window_data(window_data);
 }
@@ -882,19 +974,87 @@ pointer_uses_frame_events(struct wl_pointer *pointer) {
 }
 
 //-------------------------------------
+typedef struct {
+    uint32_t numerator;
+    uint32_t denominator;
+    bool     use_fractional;
+} SWaylandResolvedScale;
+
+//-------------------------------------
+static SWaylandResolvedScale
+resolve_surface_scale(const SWindowData_Way *window_data_specific) {
+    SWaylandResolvedScale scale = {
+        .numerator = 1u,
+        .denominator = 1u,
+        .use_fractional = false,
+    };
+
+    if (window_data_specific == NULL) {
+        return scale;
+    }
+
+    if (window_data_specific->viewport != NULL
+        && window_data_specific->preferred_scale_120 > 0) {
+        scale.numerator = window_data_specific->preferred_scale_120;
+        scale.denominator = WAYLAND_FRACTIONAL_SCALE_DENOMINATOR;
+        scale.use_fractional = true;
+        return scale;
+    }
+
+#if defined(WL_SURFACE_PREFERRED_BUFFER_SCALE_SINCE_VERSION)
+    if (window_data_specific->compositor_version >= WL_SURFACE_PREFERRED_BUFFER_SCALE_SINCE_VERSION) {
+        scale.numerator = window_data_specific->surface_preferred_scale > 0
+            ? window_data_specific->surface_preferred_scale
+            : 1u;
+        return scale;
+    }
+#endif
+
+    if (window_data_specific->integer_output_scale > 0) {
+        scale.numerator = window_data_specific->integer_output_scale;
+    }
+
+    return scale;
+}
+
+//-------------------------------------
+static bool
+scale_logical_to_physical(uint32_t value, uint32_t scale_numerator, uint32_t scale_denominator,
+                          uint32_t *physical_value) {
+    if (scale_numerator == 0 || scale_denominator == 0 || physical_value == NULL) {
+        return false;
+    }
+
+    uint64_t scaled_value = (uint64_t) value * scale_numerator;
+    uint64_t rounded_value = scaled_value / scale_denominator;
+    uint64_t remainder = scaled_value % scale_denominator;
+    if (remainder * 2u >= scale_denominator) {
+        ++rounded_value;
+    }
+
+    if (rounded_value > UINT32_MAX) {
+        return false;
+    }
+
+    *physical_value = (uint32_t) rounded_value;
+    return true;
+}
+
+//-------------------------------------
 static uint32_t
 get_cursor_buffer_scale(const SWindowData_Way *window_data_specific) {
     uint32_t scale = 1;
 
 #if defined(WL_SURFACE_SET_BUFFER_SCALE_SINCE_VERSION)
     if (window_data_specific->compositor_version >= WL_SURFACE_SET_BUFFER_SCALE_SINCE_VERSION) {
-        if (window_data_specific->preferred_scale_120 > 0) {
-            scale = (window_data_specific->preferred_scale_120 + 119u) / 120u;
-        }
-        else if (window_data_specific->integer_output_scale > 0) {
-            scale = window_data_specific->integer_output_scale;
+        SWaylandResolvedScale surface_scale = resolve_surface_scale(window_data_specific);
+        scale = surface_scale.numerator / surface_scale.denominator;
+        if (surface_scale.numerator % surface_scale.denominator != 0) {
+            ++scale;
         }
     }
+#else
+    kUnused(window_data_specific);
 #endif
 
     if (scale == 0) {
@@ -979,6 +1139,7 @@ static void
 refresh_cursor_surface(SWindowData *window_data) {
     SWindowData_Way *window_data_specific = window_data ? (SWindowData_Way *) window_data->specific : NULL;
     if (window_data_specific == NULL ||
+        window_data_specific->display == NULL ||
         window_data_specific->pointer == NULL ||
         window_data_specific->cursor_surface == NULL ||
         window_data_specific->pointer_serial_valid == 0) {
@@ -988,6 +1149,7 @@ refresh_cursor_surface(SWindowData *window_data) {
     uint32_t serial = window_data_specific->pointer_enter_serial;
     if (window_data->is_cursor_visible == false) {
         wl_pointer_set_cursor(window_data_specific->pointer, serial, NULL, 0, 0);
+        flush_request(window_data_specific->display, "cursor update");
         return;
     }
 
@@ -1056,6 +1218,7 @@ refresh_cursor_surface(SWindowData *window_data) {
                    0, 0,
                    image->width, image->height);
     wl_surface_commit(window_data_specific->cursor_surface);
+    flush_request(window_data_specific->display, "cursor update");
 }
 
 //-------------------------------------
@@ -1423,40 +1586,91 @@ wl_pointer_listener pointer_listener = {
 
 //-------------------------------------
 static void
+release_pointer_input_state(SWindowData *window_data, SWindowData_Way *window_data_specific) {
+    release_pointer(&window_data_specific->pointer);
+    invalidate_pointer_serial_state(window_data_specific);
+    clear_pointer_axis_frame(window_data_specific);
+
+    // Release any buttons still marked as pressed; otherwise getters would
+    // report them as held forever now that we won't receive release events.
+    for (uint32_t button = 0; button < MFB_MAX_MOUSE_BUTTONS; ++button) {
+        if (window_data->mouse_button_status[button] != 0) {
+            window_data->mouse_button_status[button] = 0;
+            kCall(mouse_btn_func, (mfb_mouse_button) button, (mfb_key_mod) window_data->mod_keys, false);
+        }
+    }
+}
+
+//-------------------------------------
+static void
+release_keyboard_input_state(SWindowData *window_data, SWindowData_Way *window_data_specific) {
+    release_keyboard(&window_data_specific->keyboard);
+
+    // Emit releases for keys whose real release events can no longer arrive.
+    for (uint32_t key = 0; key < MFB_MAX_KEYS; ++key) {
+        if (window_data->key_status[key] != 0) {
+            window_data->key_status[key] = 0;
+            kCall(keyboard_func, (mfb_key) key, (mfb_key_mod) window_data->mod_keys, false);
+        }
+    }
+
+    wayland_clear_keyboard_focus_state(window_data, window_data_specific);
+}
+
+//-------------------------------------
+static void
+release_active_seat(SWindowData *window_data, SWindowData_Way *window_data_specific) {
+    release_keyboard_input_state(window_data, window_data_specific);
+    release_pointer_input_state(window_data, window_data_specific);
+    release_seat(&window_data_specific->seat);
+    window_data_specific->seat_id = 0;
+    window_data_specific->seat_version = 0;
+}
+
+//-------------------------------------
+static void
 seat_capabilities(void *data, struct wl_seat *seat, enum wl_seat_capability caps) {
     SWindowData       *window_data     = (SWindowData *) data;
     SWindowData_Way   *window_data_specific = (SWindowData_Way *) window_data->specific;
+    if (seat != window_data_specific->seat) {
+        return;
+    }
+
     if ((caps & WL_SEAT_CAPABILITY_KEYBOARD) && !window_data_specific->keyboard) {
         window_data_specific->keyboard = wl_seat_get_keyboard(seat);
         if (window_data_specific->keyboard) {
             wl_keyboard_add_listener(window_data_specific->keyboard, &g_wayland_keyboard_listener, window_data);
+            MFB_LOG(MFB_LOG_TRACE,
+                    "WaylandMiniFB: keyboard capability acquired (wl_keyboard version %u).",
+                    wl_proxy_get_version((struct wl_proxy *) window_data_specific->keyboard)
+            );
         }
     }
 
     else if (!(caps & WL_SEAT_CAPABILITY_KEYBOARD) && window_data_specific->keyboard) {
-        release_keyboard(&window_data_specific->keyboard);
-        wayland_clear_keyboard_focus_state(window_data, window_data_specific);
+        MFB_LOG(MFB_LOG_TRACE,
+                "WaylandMiniFB: keyboard capability removed (wl_keyboard version %u).",
+                wl_proxy_get_version((struct wl_proxy *) window_data_specific->keyboard)
+        );
+        release_keyboard_input_state(window_data, window_data_specific);
     }
 
     if ((caps & WL_SEAT_CAPABILITY_POINTER) && !window_data_specific->pointer) {
         window_data_specific->pointer = wl_seat_get_pointer(seat);
         if (window_data_specific->pointer) {
             wl_pointer_add_listener(window_data_specific->pointer, &pointer_listener, window_data);
+            MFB_LOG(MFB_LOG_TRACE,
+                    "WaylandMiniFB: pointer capability acquired (wl_pointer version %u).",
+                    wl_proxy_get_version((struct wl_proxy *) window_data_specific->pointer)
+            );
         }
     }
     else if (!(caps & WL_SEAT_CAPABILITY_POINTER) && window_data_specific->pointer) {
-        release_pointer(&window_data_specific->pointer);
-        invalidate_pointer_serial_state(window_data_specific);
-        clear_pointer_axis_frame(window_data_specific);
-
-        // Release any buttons still marked as pressed; otherwise getters would
-        // report them as held forever now that we won't receive release events.
-        for (uint32_t button = 0; button < MFB_MAX_MOUSE_BUTTONS; ++button) {
-            if (window_data->mouse_button_status[button] != 0) {
-                window_data->mouse_button_status[button] = 0;
-                kCall(mouse_btn_func, (mfb_mouse_button) button, (mfb_key_mod) window_data->mod_keys, false);
-            }
-        }
+        MFB_LOG(MFB_LOG_TRACE,
+                "WaylandMiniFB: pointer capability removed (wl_pointer version %u).",
+                wl_proxy_get_version((struct wl_proxy *) window_data_specific->pointer)
+        );
+        release_pointer_input_state(window_data, window_data_specific);
     }
 }
 
@@ -1525,8 +1739,17 @@ fractional_scale_preferred_scale(void *data, struct wp_fractional_scale_v1 *frac
     if (window_data_specific == NULL) {
         return;
     }
-    window_data_specific->preferred_scale_120 = scale;
-    refresh_cursor_surface(window_data);
+
+    if (scale == 0 || scale > WAYLAND_MAX_FRACTIONAL_SCALE_120) {
+        MFB_LOG(MFB_LOG_WARNING,
+                "WaylandMiniFB: ignoring unsupported fractional scale %u/120.", scale);
+        return;
+    }
+
+    if (window_data_specific->preferred_scale_120 != scale) {
+        window_data_specific->preferred_scale_120 = scale;
+        refresh_cursor_surface(window_data);
+    }
 }
 
 //-------------------------------------
@@ -1552,7 +1775,7 @@ find_output_index(SWindowData_Way *window_data_specific, struct wl_output *outpu
 //-------------------------------------
 // Recompute the integer output scale from all outputs the surface currently
 // overlaps.  Uses the maximum scale so content is never blurry on any of them.
-// Only meaningful when fractional scale is unavailable.
+// Used as a fallback when no applicable per-surface scale preference exists.
 //-------------------------------------
 static void
 recompute_output_scale(SWindowData_Way *window_data_specific) {
@@ -1619,8 +1842,13 @@ output_scale(void *data, struct wl_output *output, int32_t factor) {
         return;
     }
 
-    uint32_t scale = (factor > 0) ? (uint32_t) factor : 1;
-    window_data_specific->output_scales[idx] = scale;
+    if (factor <= 0 || factor > (int32_t) WAYLAND_MAX_BUFFER_SCALE) {
+        MFB_LOG(MFB_LOG_WARNING,
+                "WaylandMiniFB: ignoring unsupported output buffer scale %d.", factor);
+        return;
+    }
+
+    window_data_specific->output_scales[idx] = (uint32_t) factor;
     if (window_data_specific->output_entered[idx]) {
         recompute_output_scale(window_data_specific);
         refresh_cursor_surface(window_data);
@@ -1711,13 +1939,28 @@ surface_leave(void *data, struct wl_surface *surface, struct wl_output *output) 
 
 //-------------------------------------
 // Compositor-preferred integer buffer scale for this surface.
-// Currently unused; the backend derives scale from fractional-scale/output data.
 //-------------------------------------
 static void
 surface_preferred_buffer_scale(void *data, struct wl_surface *surface, int32_t factor) {
-    kUnused(data);
     kUnused(surface);
-    kUnused(factor);
+
+    SWindowData *window_data = (SWindowData *) data;
+    SWindowData_Way *window_data_specific = window_data ? (SWindowData_Way *) window_data->specific : NULL;
+    if (window_data_specific == NULL) {
+        return;
+    }
+
+    if (factor <= 0 || factor > (int32_t) WAYLAND_MAX_BUFFER_SCALE) {
+        MFB_LOG(MFB_LOG_WARNING,
+                "WaylandMiniFB: ignoring unsupported preferred buffer scale %d.", factor);
+        return;
+    }
+
+    uint32_t preferred_scale = (uint32_t) factor;
+    if (window_data_specific->surface_preferred_scale != preferred_scale) {
+        window_data_specific->surface_preferred_scale = preferred_scale;
+        refresh_cursor_surface(window_data);
+    }
 }
 
 #endif
@@ -1767,50 +2010,68 @@ static void
 registry_global(void *data, struct wl_registry *registry, uint32_t id, char const *iface, uint32_t version) {
     SWindowData         *window_data     = (SWindowData *) data;
     SWindowData_Way   *window_data_specific = (SWindowData_Way *) window_data->specific;
+    if (window_data_specific->backend_unusable != 0) {
+        return;
+    }
+
     if (strcmp(iface, "wl_compositor") == 0) {
-        uint32_t client_version = (uint32_t) wl_compositor_interface.version;
-        uint32_t use_version = version < client_version ? version : client_version;
-        window_data_specific->compositor = (struct wl_compositor *) wl_registry_bind(registry, id, &wl_compositor_interface, use_version);
-        window_data_specific->compositor_version = use_version;
-        MFB_LOG(MFB_LOG_TRACE, "wl_compositor: server=%u client=%u using=%u", version, client_version, use_version);
+        if (window_data_specific->compositor == NULL) {
+            uint32_t use_version = negotiate_protocol_version(version, &wl_compositor_interface,
+                                                              WAYLAND_COMPILED_COMPOSITOR_VERSION);
+            window_data_specific->compositor = (struct wl_compositor *) wl_registry_bind(registry, id, &wl_compositor_interface, use_version);
+            if (window_data_specific->compositor != NULL) {
+                window_data_specific->compositor_id = id;
+                window_data_specific->compositor_version = use_version;
+            }
+        }
     }
 
     else if (strcmp(iface, "wl_shm") == 0) {
-        uint32_t client_version = (uint32_t) wl_shm_interface.version;
-        uint32_t use_version = version < client_version ? version : client_version;
-        window_data_specific->shm = (struct wl_shm *) wl_registry_bind(registry, id, &wl_shm_interface, use_version);
-        MFB_LOG(MFB_LOG_TRACE, "wl_shm: server=%u client=%u using=%u", version, client_version, use_version);
-        if (window_data_specific->shm) {
-            wl_shm_add_listener(window_data_specific->shm, &shm_listener, window_data);
+        if (window_data_specific->shm == NULL) {
+            uint32_t use_version = negotiate_protocol_version(version, &wl_shm_interface,
+                                                              WAYLAND_COMPILED_SHM_VERSION);
+            window_data_specific->shm = (struct wl_shm *) wl_registry_bind(registry, id, &wl_shm_interface, use_version);
+            if (window_data_specific->shm != NULL) {
+                window_data_specific->shm_id = id;
+                wl_shm_add_listener(window_data_specific->shm, &shm_listener, window_data);
+            }
         }
     }
 
     else if (strcmp(iface, "xdg_wm_base") == 0) {
-        uint32_t client_version = (uint32_t) xdg_wm_base_interface.version;
-        uint32_t use_version = version < client_version ? version : client_version;
-        window_data_specific->shell = (struct xdg_wm_base *) wl_registry_bind(registry, id, &xdg_wm_base_interface, use_version);
-        MFB_LOG(MFB_LOG_TRACE, "xdg_wm_base: server=%u client=%u using=%u", version, client_version, use_version);
-        if (window_data_specific->shell) {
-            xdg_wm_base_add_listener(window_data_specific->shell, &shell_listener, NULL);
+        if (window_data_specific->shell == NULL) {
+            uint32_t compiled_version = (uint32_t) xdg_wm_base_interface.version;
+            uint32_t use_version = negotiate_protocol_version(version, &xdg_wm_base_interface, compiled_version);
+            window_data_specific->shell = (struct xdg_wm_base *) wl_registry_bind(registry, id, &xdg_wm_base_interface, use_version);
+            if (window_data_specific->shell != NULL) {
+                window_data_specific->shell_id = id;
+                xdg_wm_base_add_listener(window_data_specific->shell, &shell_listener, NULL);
+            }
         }
     }
 
     else if (strcmp(iface, "wl_seat") == 0) {
-        uint32_t client_version = (uint32_t) wl_seat_interface.version;
-        uint32_t use_version = version < client_version ? version : client_version;
-        window_data_specific->seat = (struct wl_seat *) wl_registry_bind(registry, id, &wl_seat_interface, use_version);
-        window_data_specific->seat_version = use_version;
-        MFB_LOG(MFB_LOG_TRACE, "wl_seat: server=%u client=%u using=%u", version, client_version, use_version);
-        if (window_data_specific->seat) {
-            wl_seat_add_listener(window_data_specific->seat, &seat_listener, window_data);
+        if (window_data_specific->seat == NULL) {
+            uint32_t use_version = negotiate_protocol_version(version, &wl_seat_interface,
+                                                              WAYLAND_COMPILED_SEAT_VERSION);
+            window_data_specific->seat = (struct wl_seat *) wl_registry_bind(registry, id, &wl_seat_interface, use_version);
+            if (window_data_specific->seat != NULL) {
+                window_data_specific->seat_id = id;
+                window_data_specific->seat_version = use_version;
+                wl_seat_add_listener(window_data_specific->seat, &seat_listener, window_data);
+            }
+        }
+        else {
+            MFB_LOG(MFB_LOG_WARNING,
+                    "WaylandMiniFB: ignoring additional wl_seat global %u; the backend uses the first announced seat.",
+                    id);
         }
     }
 
     else if (strcmp(iface, "wl_output") == 0) {
-        uint32_t client_version = (uint32_t) wl_output_interface.version;
-        uint32_t use_version = version < client_version ? version : client_version;
+        uint32_t use_version = negotiate_protocol_version(version, &wl_output_interface,
+                                                          WAYLAND_COMPILED_OUTPUT_VERSION);
         struct wl_output *output = (struct wl_output *) wl_registry_bind(registry, id, &wl_output_interface, use_version);
-        MFB_LOG(MFB_LOG_TRACE, "wl_output: server=%u client=%u using=%u", version, client_version, use_version);
         if (output) {
             wl_output_add_listener(output, &output_listener, window_data);
             if (window_data_specific->output_count < WAYLAND_MAX_OUTPUTS) {
@@ -1826,27 +2087,41 @@ registry_global(void *data, struct wl_registry *registry, uint32_t id, char cons
     }
 
     else if (strcmp(iface, "wp_fractional_scale_manager_v1") == 0) {
-        uint32_t client_version = (uint32_t) wp_fractional_scale_manager_v1_interface.version;
-        uint32_t use_version = version < client_version ? version : client_version;
-        window_data_specific->fractional_scale_manager = (struct wp_fractional_scale_manager_v1 *)
-            wl_registry_bind(registry, id, &wp_fractional_scale_manager_v1_interface, use_version);
-        MFB_LOG(MFB_LOG_TRACE, "wp_fractional_scale_manager_v1: server=%u client=%u using=%u", version, client_version, use_version);
+        if (window_data_specific->fractional_scale_manager == NULL) {
+            uint32_t compiled_version = (uint32_t) wp_fractional_scale_manager_v1_interface.version;
+            uint32_t use_version = negotiate_protocol_version(version, &wp_fractional_scale_manager_v1_interface,
+                                                              compiled_version);
+            window_data_specific->fractional_scale_manager = (struct wp_fractional_scale_manager_v1 *)
+                wl_registry_bind(registry, id, &wp_fractional_scale_manager_v1_interface, use_version);
+            if (window_data_specific->fractional_scale_manager != NULL) {
+                window_data_specific->fractional_scale_manager_id = id;
+            }
+        }
     }
 
     else if (strcmp(iface, "wp_viewporter") == 0) {
-        uint32_t client_version = (uint32_t) wp_viewporter_interface.version;
-        uint32_t use_version = version < client_version ? version : client_version;
-        window_data_specific->viewporter = (struct wp_viewporter *)
-            wl_registry_bind(registry, id, &wp_viewporter_interface, use_version);
-        MFB_LOG(MFB_LOG_TRACE, "wp_viewporter: server=%u client=%u using=%u", version, client_version, use_version);
+        if (window_data_specific->viewporter == NULL) {
+            uint32_t compiled_version = (uint32_t) wp_viewporter_interface.version;
+            uint32_t use_version = negotiate_protocol_version(version, &wp_viewporter_interface, compiled_version);
+            window_data_specific->viewporter = (struct wp_viewporter *)
+                wl_registry_bind(registry, id, &wp_viewporter_interface, use_version);
+            if (window_data_specific->viewporter != NULL) {
+                window_data_specific->viewporter_id = id;
+            }
+        }
     }
 
     else if (strcmp(iface, "zxdg_decoration_manager_v1") == 0) {
-        uint32_t client_version = (uint32_t) zxdg_decoration_manager_v1_interface.version;
-        uint32_t use_version = version < client_version ? version : client_version;
-        window_data_specific->decoration_manager = (struct zxdg_decoration_manager_v1 *)
-            wl_registry_bind(registry, id, &zxdg_decoration_manager_v1_interface, use_version);
-        MFB_LOG(MFB_LOG_TRACE, "zxdg_decoration_manager_v1: server=%u client=%u using=%u", version, client_version, use_version);
+        if (window_data_specific->decoration_manager == NULL) {
+            uint32_t compiled_version = (uint32_t) zxdg_decoration_manager_v1_interface.version;
+            uint32_t use_version = negotiate_protocol_version(version, &zxdg_decoration_manager_v1_interface,
+                                                              compiled_version);
+            window_data_specific->decoration_manager = (struct zxdg_decoration_manager_v1 *)
+                wl_registry_bind(registry, id, &zxdg_decoration_manager_v1_interface, use_version);
+            if (window_data_specific->decoration_manager != NULL) {
+                window_data_specific->decoration_manager_id = id;
+            }
+        }
     }
 }
 
@@ -1858,10 +2133,84 @@ registry_global_remove(void *data, struct wl_registry *registry, uint32_t name) 
     SWindowData     *window_data          = (SWindowData *) data;
     SWindowData_Way *window_data_specific = (SWindowData_Way *) window_data->specific;
 
+    if (name == window_data_specific->seat_id) {
+        MFB_LOG(MFB_LOG_WARNING,
+                "WaylandMiniFB: active wl_seat global %u was removed; keyboard and pointer input are now unavailable.",
+                name);
+        release_active_seat(window_data, window_data_specific);
+        flush_request(window_data_specific->display, "seat removal cleanup");
+        return;
+    }
+
+    if (name == window_data_specific->decoration_manager_id) {
+        kWaylandDestroy(window_data_specific->toplevel_decoration, zxdg_toplevel_decoration_v1_destroy);
+        kWaylandDestroy(window_data_specific->decoration_manager, zxdg_decoration_manager_v1_destroy);
+        window_data_specific->decoration_manager_id = 0;
+        flush_request(window_data_specific->display, "decoration manager removal cleanup");
+        return;
+    }
+
+    if (name == window_data_specific->fractional_scale_manager_id) {
+        kWaylandDestroy(window_data_specific->fractional_scale, wp_fractional_scale_v1_destroy);
+        kWaylandDestroy(window_data_specific->fractional_scale_manager, wp_fractional_scale_manager_v1_destroy);
+        window_data_specific->fractional_scale_manager_id = 0;
+        window_data_specific->preferred_scale_120 = 0;
+        refresh_cursor_surface(window_data);
+        flush_request(window_data_specific->display, "fractional scale manager removal cleanup");
+        return;
+    }
+
+    if (name == window_data_specific->viewporter_id) {
+        kWaylandDestroy(window_data_specific->viewport, wp_viewport_destroy);
+        kWaylandDestroy(window_data_specific->viewporter, wp_viewporter_destroy);
+        window_data_specific->viewporter_id = 0;
+        window_data_specific->preferred_scale_120 = 0;
+        refresh_cursor_surface(window_data);
+        flush_request(window_data_specific->display, "viewporter removal cleanup");
+        return;
+    }
+
+    if (name == window_data_specific->shell_id) {
+        MFB_LOG(MFB_LOG_ERROR, "WaylandMiniFB: required xdg_wm_base global %u was removed.", name);
+        kWaylandDestroy(window_data_specific->toplevel_decoration, zxdg_toplevel_decoration_v1_destroy);
+        kWaylandDestroy(window_data_specific->toplevel, xdg_toplevel_destroy);
+        kWaylandDestroy(window_data_specific->shell_surface, xdg_surface_destroy);
+        kWaylandDestroy(window_data_specific->shell, xdg_wm_base_destroy);
+        window_data_specific->shell_id = 0;
+        window_data_specific->backend_unusable = 1;
+        flush_request(window_data_specific->display, "xdg_wm_base removal cleanup");
+        return;
+    }
+
+    if (name == window_data_specific->shm_id) {
+        MFB_LOG(MFB_LOG_ERROR, "WaylandMiniFB: required wl_shm global %u was removed.", name);
+        release_shm(&window_data_specific->shm);
+        window_data_specific->shm_id = 0;
+        window_data_specific->shm_format = -1u;
+        window_data_specific->backend_unusable = 1;
+        flush_request(window_data_specific->display, "wl_shm removal cleanup");
+        return;
+    }
+
+    if (name == window_data_specific->compositor_id) {
+        MFB_LOG(MFB_LOG_ERROR, "WaylandMiniFB: required wl_compositor global %u was removed.", name);
+        kWaylandDestroy(window_data_specific->compositor, wl_compositor_destroy);
+        window_data_specific->compositor_id = 0;
+        window_data_specific->compositor_version = 0;
+        window_data_specific->backend_unusable = 1;
+        flush_request(window_data_specific->display, "wl_compositor removal cleanup");
+        return;
+    }
+
     for (uint32_t i = 0; i < window_data_specific->output_count; ++i) {
         if (window_data_specific->output_ids[i] == name) {
             bool was_entered = window_data_specific->output_entered[i];
 
+            MFB_LOG(MFB_LOG_TRACE,
+                    "WaylandMiniFB: output removed (registry id %u, wl_output version %u).",
+                    name,
+                    wl_proxy_get_version((struct wl_proxy *) window_data_specific->outputs[i])
+            );
             release_output(&window_data_specific->outputs[i]);
 
             // Compact arrays by moving the last element into the gap
@@ -1882,6 +2231,7 @@ registry_global_remove(void *data, struct wl_registry *registry, uint32_t name) 
                 recompute_output_scale(window_data_specific);
                 refresh_cursor_surface(window_data);
             }
+            flush_request(window_data_specific->display, "output removal cleanup");
             break;
         }
     }
@@ -1896,10 +2246,34 @@ wl_registry_listener registry_listener = {
 
 //-------------------------------------
 static void
+apply_pending_toplevel_configure(SWindowData *window_data,
+                                 SWindowData_Way *window_data_specific) {
+    SWaylandPendingConfigure *pending_configure = &window_data_specific->pending_configure;
+
+    if (pending_configure->has_toplevel == 0) {
+        return;
+    }
+
+    if (pending_configure->has_size != 0
+        && (window_data->window_width != pending_configure->width
+        || window_data->window_height != pending_configure->height)) {
+        window_data->window_width  = pending_configure->width;
+        window_data->window_height = pending_configure->height;
+        resize_dst(window_data, pending_configure->width, pending_configure->height);
+        window_data->must_resize_context = true;
+    }
+
+    pending_configure->has_toplevel = 0;
+    pending_configure->has_size = 0;
+}
+
+//-------------------------------------
+static void
 handle_shell_surface_configure(void *data, struct xdg_surface *shell_surface, uint32_t serial) {
     SWindowData *window_data = (SWindowData *) data;
     SWindowData_Way *window_data_specific = (SWindowData_Way *) window_data->specific;
 
+    apply_pending_toplevel_configure(window_data, window_data_specific);
     xdg_surface_ack_configure(shell_surface, serial);
 
     // Some compositors apply startup states (fullscreen/maximized) more reliably
@@ -1950,13 +2324,23 @@ handle_toplevel_configure(void *data, struct xdg_toplevel *xdg_toplevel, int32_t
     kUnused(states);
 
     SWindowData *window_data = (SWindowData *) data;
-    if (window_data && width > 0 && height > 0) {
-        if (window_data->window_width != (unsigned) width || window_data->window_height != (unsigned) height) {
-            window_data->window_width  = (unsigned) width;
-            window_data->window_height = (unsigned) height;
-            resize_dst(window_data, (unsigned) width, (unsigned) height);
-            window_data->must_resize_context = true;
-        }
+    if (window_data == NULL || window_data->specific == NULL) {
+        return;
+    }
+
+    SWindowData_Way *window_data_specific = (SWindowData_Way *) window_data->specific;
+    SWaylandPendingConfigure *pending_configure = &window_data_specific->pending_configure;
+
+    // xdg_toplevel state is latched until the terminal xdg_surface.configure.
+    pending_configure->has_toplevel = 1;
+    pending_configure->has_size = (width > 0 && height > 0) ? 1 : 0;
+    if (pending_configure->has_size != 0) {
+        pending_configure->width = (uint32_t) width;
+        pending_configure->height = (uint32_t) height;
+    }
+    else {
+        pending_configure->width = 0;
+        pending_configure->height = 0;
     }
 
     MFB_LOG(MFB_LOG_DEBUG, "Toplevel configure: width=%d, height=%d", width, height);
@@ -2031,7 +2415,92 @@ static const struct wl_buffer_listener buffer_listener = {
 };
 
 //-------------------------------------
-// Destroy a slot's resources (pool, buffer, mmap, fd).
+static int
+create_temporary_shm_file(void) {
+    const char *runtime_dir = getenv("XDG_RUNTIME_DIR");
+    char path[PATH_MAX];
+    int path_length;
+    int fd;
+
+    if (runtime_dir == NULL || runtime_dir[0] == '\0') {
+        errno = ENOENT;
+        return -1;
+    }
+
+    path_length = snprintf(path, sizeof(path), "%s/mfb-shm-XXXXXX", runtime_dir);
+    if (path_length < 0 || path_length >= (int) sizeof(path)) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+
+#if defined(O_CLOEXEC)
+    fd = mkostemp(path, O_CLOEXEC);
+#else
+    fd = mkstemp(path);
+#endif
+    if (fd == -1) {
+        return -1;
+    }
+
+    if (unlink(path) == -1) {
+        int error_code = errno;
+        close(fd);
+        errno = error_code;
+        return -1;
+    }
+
+#if !defined(O_CLOEXEC)
+    int fd_flags = fcntl(fd, F_GETFD);
+    if (fd_flags == -1 || fcntl(fd, F_SETFD, fd_flags | FD_CLOEXEC) == -1) {
+        int error_code = errno;
+        close(fd);
+        errno = error_code;
+        return -1;
+    }
+#endif
+
+    return fd;
+}
+
+//-------------------------------------
+static int
+create_anonymous_shm_file(size_t size) {
+    int fd = -1;
+    int result;
+
+#if defined(MFD_CLOEXEC) && defined(MFD_ALLOW_SEALING)
+    fd = memfd_create("minifb-shm", MFD_CLOEXEC | MFD_ALLOW_SEALING);
+    if (fd >= 0) {
+#if defined(F_ADD_SEALS) && defined(F_SEAL_SHRINK)
+        // Best effort: prevent later shrinking while mappings may be in use.
+        (void) fcntl(fd, F_ADD_SEALS, F_SEAL_SHRINK);
+#endif
+    }
+#endif
+
+    if (fd == -1) {
+        fd = create_temporary_shm_file();
+        if (fd == -1) {
+            return -1;
+        }
+    }
+
+    do {
+        result = ftruncate(fd, (off_t) size);
+    } while (result == -1 && errno == EINTR);
+
+    if (result == -1) {
+        int error_code = errno;
+        close(fd);
+        errno = error_code;
+        return -1;
+    }
+
+    return fd;
+}
+
+//-------------------------------------
+// Destroy the resources retained for a slot after buffer creation.
 //-------------------------------------
 static void
 slot_destroy(SWaylandBufferSlot *slot) {
@@ -2039,18 +2508,10 @@ slot_destroy(SWaylandBufferSlot *slot) {
         wl_buffer_destroy(slot->wl_buf);
         slot->wl_buf = NULL;
     }
-    if (slot->pool) {
-        wl_shm_pool_destroy(slot->pool);
-        slot->pool = NULL;
-    }
     if (slot->shm_ptr && slot->shm_ptr != MAP_FAILED && slot->pool_size > 0) {
         munmap(slot->shm_ptr, slot->pool_size);
-        slot->shm_ptr = NULL;
     }
-    if (slot->fd >= 0) {
-        close(slot->fd);
-        slot->fd = -1;
-    }
+    slot->shm_ptr   = NULL;
     slot->pool_size = 0;
     slot->width     = 0;
     slot->height    = 0;
@@ -2058,8 +2519,7 @@ slot_destroy(SWaylandBufferSlot *slot) {
 }
 
 //-------------------------------------
-// Rebuild a slot's pool+buffer if its dimensions are stale.
-// Each slot owns its own fd, mmap, and wl_shm_pool - no shared offsets.
+// Rebuild a slot's mapping and buffer if its dimensions are stale.
 // Returns true on success (or if no rebuild was needed).
 //-------------------------------------
 static bool
@@ -2085,68 +2545,71 @@ slot_ensure_buffer(SWaylandBufferSlot *slot,
         return false;
     }
 
-    // Create anonymous shared memory.
-    char const *xdg_rt_dir = getenv("XDG_RUNTIME_DIR");
-    if (xdg_rt_dir == NULL) {
-        return false;
-    }
-    char shmfile[PATH_MAX];
-    if (snprintf(shmfile, sizeof(shmfile), "%s/mfb-slot-XXXXXX", xdg_rt_dir) >= (int) sizeof(shmfile)) {
-        return false;
-    }
-    slot->fd = mkstemp(shmfile);
-    if (slot->fd == -1) {
-        return false;
-    }
-    unlink(shmfile);
-
-    if (ftruncate(slot->fd, (off_t) pool_size) == -1) {
-        close(slot->fd);
-        slot->fd = -1;
+    if (window_data_specific->shm == NULL || window_data_specific->render_queue == NULL) {
+        MFB_LOG(MFB_LOG_ERROR, "WaylandMiniFB: cannot create a SHM buffer without wl_shm and render_queue.");
         return false;
     }
 
-    slot->shm_ptr = (uint32_t *) mmap(NULL, pool_size, PROT_WRITE, MAP_SHARED, slot->fd, 0);
-    if (slot->shm_ptr == MAP_FAILED) {
-        slot->shm_ptr = NULL;
-        close(slot->fd);
-        slot->fd = -1;
+    int fd = create_anonymous_shm_file(pool_size);
+    if (fd == -1) {
+        int error_code = errno;
+        MFB_LOG(MFB_LOG_ERROR, "WaylandMiniFB: failed to create %zu-byte anonymous SHM file: %s (%d).",
+                pool_size, strerror(error_code), error_code);
         return false;
     }
-    slot->pool_size = pool_size;
 
-    slot->pool = wl_shm_create_pool(window_data_specific->shm, slot->fd, (int) pool_size);
-    if (slot->pool == NULL) {
-        munmap(slot->shm_ptr, pool_size);
-        slot->shm_ptr = NULL;
-        close(slot->fd);
-        slot->fd = -1;
-        slot->pool_size = 0;
+    uint32_t *shm_ptr = (uint32_t *) mmap(NULL, pool_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (shm_ptr == MAP_FAILED) {
+        int error_code = errno;
+        close(fd);
+        MFB_LOG(MFB_LOG_ERROR, "WaylandMiniFB: failed to map %zu-byte SHM file: %s (%d).",
+                pool_size, strerror(error_code), error_code);
+        return false;
+    }
+
+    struct wl_shm_pool *pool = wl_shm_create_pool(window_data_specific->shm, fd, (int) pool_size);
+    if (pool == NULL) {
+        munmap(shm_ptr, pool_size);
+        close(fd);
+        MFB_LOG(MFB_LOG_ERROR, "WaylandMiniFB: wl_shm_create_pool returned NULL.");
         return false;
     }
 
     // Route pool to render_queue so buffer release events go there.
-    if (window_data_specific->render_queue != NULL) {
-        wl_proxy_set_queue((struct wl_proxy *) slot->pool, window_data_specific->render_queue);
-    }
+    wl_proxy_set_queue((struct wl_proxy *) pool, window_data_specific->render_queue);
 
-    slot->wl_buf = wl_shm_pool_create_buffer(slot->pool, 0,
-                        surface_w, surface_h,
-                        stride, window_data_specific->shm_format);
-    if (slot->wl_buf == NULL) {
-        wl_shm_pool_destroy(slot->pool);
-        slot->pool = NULL;
-        munmap(slot->shm_ptr, pool_size);
-        slot->shm_ptr = NULL;
-        close(slot->fd);
-        slot->fd = -1;
-        slot->pool_size = 0;
+    struct wl_buffer *wl_buf = wl_shm_pool_create_buffer(pool, 0,
+                                                        surface_w, surface_h,
+                                                        stride, window_data_specific->shm_format);
+    if (wl_buf == NULL) {
+        wl_shm_pool_destroy(pool);
+        munmap(shm_ptr, pool_size);
+        close(fd);
+        MFB_LOG(MFB_LOG_ERROR, "WaylandMiniFB: wl_shm_pool_create_buffer returned NULL.");
         return false;
     }
 
-    wl_buffer_add_listener(slot->wl_buf, &buffer_listener, slot);
-    slot->width  = surface_w;
-    slot->height = surface_h;
+    // Keep release events on render_queue even after the temporary pool proxy
+    // is destroyed below.
+    wl_proxy_set_queue((struct wl_proxy *) wl_buf, window_data_specific->render_queue);
+
+    if (wl_buffer_add_listener(wl_buf, &buffer_listener, slot) != 0) {
+        wl_buffer_destroy(wl_buf);
+        wl_shm_pool_destroy(pool);
+        munmap(shm_ptr, pool_size);
+        close(fd);
+        MFB_LOG(MFB_LOG_ERROR, "WaylandMiniFB: failed to add the SHM buffer listener.");
+        return false;
+    }
+
+    wl_shm_pool_destroy(pool);
+    close(fd);
+
+    slot->wl_buf    = wl_buf;
+    slot->shm_ptr   = shm_ptr;
+    slot->pool_size = pool_size;
+    slot->width     = surface_w;
+    slot->height    = surface_h;
 
     return true;
 }
@@ -2171,7 +2634,6 @@ create_shm_buffer(SWindowData *window_data, SWindowData_Way *window_data_specifi
     for (int i = 0; i < WAYLAND_BUFFER_SLOTS; ++i) {
         SWaylandBufferSlot *slot = &window_data_specific->slots[i];
         memset(slot, 0, sizeof(*slot));
-        slot->fd = -1;
         if (!slot_ensure_buffer(slot, window_data_specific, width, height)) {
             MFB_LOG(MFB_LOG_ERROR, "WaylandMiniFB: initial buffer creation failed for slot %d.", i);
             return false;
@@ -2263,6 +2725,19 @@ create_xdg_toplevel(SWindowData *window_data, SWindowData_Way *window_data_speci
         return false;
     }
 
+    // Ensure the mapping requests issued by the configure handler have been
+    // sent and processed before mfb_open_ex returns.
+    if (wl_display_roundtrip_queue(window_data_specific->display,
+                                   window_data_specific->window_queue) == -1) {
+        MFB_LOG(MFB_LOG_ERROR, "WaylandMiniFB: failed to complete the initial surface mapping.");
+        return false;
+    }
+
+    if (window_data->close == true) {
+        MFB_LOG(MFB_LOG_ERROR, "WaylandMiniFB: initialization was cancelled while completing the initial surface mapping.");
+        return false;
+    }
+
     return true;
 }
 
@@ -2307,9 +2782,6 @@ mfb_open_ex(const char *title, unsigned width, unsigned height, unsigned flags) 
     }
     memset(window_data_specific, 0, sizeof(SWindowData_Way));
     window_data_specific->integer_output_scale = 1;
-    for (int i = 0; i < WAYLAND_BUFFER_SLOTS; ++i) {
-        window_data_specific->slots[i].fd = -1;
-    }
     window_data->specific = window_data_specific;
 
     window_data_specific->shm_format = -1u;
@@ -2370,8 +2842,8 @@ mfb_open_ex(const char *title, unsigned width, unsigned height, unsigned flags) 
         MFB_LOG(MFB_LOG_WARNING, "WaylandMiniFB: zxdg_decoration_manager_v1 is unavailable; server-side decorations control may be limited.");
     }
 
-    if (!window_data_specific->fractional_scale_manager) {
-        MFB_LOG(MFB_LOG_WARNING, "WaylandMiniFB: wp_fractional_scale_manager_v1 is unavailable; falling back to integer wl_output scale.");
+    if (!window_data_specific->fractional_scale_manager || !window_data_specific->viewporter) {
+        MFB_LOG(MFB_LOG_WARNING, "WaylandMiniFB: fractional surface scaling is unavailable; using integer surface scaling.");
     }
 
     if (!window_data_specific->seat) {
@@ -2491,17 +2963,19 @@ typedef enum {
 } EWaylandSlotAcquireStatus;
 
 //-------------------------------------
-static void
+static bool
 compute_presentation_metrics(const SWindowData *window_data,
                              const SWindowData_Way *window_data_specific,
                              SWaylandPresentationMetrics *metrics) {
+    SWaylandResolvedScale surface_scale = resolve_surface_scale(window_data_specific);
+
     metrics->logical_surface_width  = window_data->window_width;
     metrics->logical_surface_height = window_data->window_height;
     metrics->logical_dst_offset_x   = window_data->dst_offset_x;
     metrics->logical_dst_offset_y   = window_data->dst_offset_y;
     metrics->logical_dst_width      = window_data->dst_width;
     metrics->logical_dst_height     = window_data->dst_height;
-    metrics->integer_scale          = window_data_specific->integer_output_scale;
+    metrics->integer_scale          = surface_scale.use_fractional == true ? 1u : surface_scale.numerator;
     metrics->use_buffer_scale       = false;
     metrics->use_fractional         = false;
 
@@ -2510,16 +2984,32 @@ compute_presentation_metrics(const SWindowData *window_data,
     }
 
     // 4B: fractional HiDPI via wp_viewporter - takes priority over 4A.
-    if (window_data_specific->viewport != NULL
-        && window_data_specific->preferred_scale_120 > 0) {
-        float fscale = (float) window_data_specific->preferred_scale_120 / 120.0f;
-        metrics->use_fractional          = true;
-        metrics->physical_surface_width  = (uint32_t) ((float) metrics->logical_surface_width  * fscale + 0.5f);
-        metrics->physical_surface_height = (uint32_t) ((float) metrics->logical_surface_height * fscale + 0.5f);
-        metrics->physical_dst_offset_x   = (uint32_t) ((float) metrics->logical_dst_offset_x   * fscale + 0.5f);
-        metrics->physical_dst_offset_y   = (uint32_t) ((float) metrics->logical_dst_offset_y   * fscale + 0.5f);
-        metrics->physical_dst_width      = (uint32_t) ((float) metrics->logical_dst_width      * fscale + 0.5f);
-        metrics->physical_dst_height     = (uint32_t) ((float) metrics->logical_dst_height     * fscale + 0.5f);
+    if (surface_scale.use_fractional == true) {
+        if (scale_logical_to_physical(metrics->logical_surface_width,
+                                      surface_scale.numerator, surface_scale.denominator,
+                                      &metrics->physical_surface_width) == false
+            || scale_logical_to_physical(metrics->logical_surface_height,
+                                         surface_scale.numerator, surface_scale.denominator,
+                                         &metrics->physical_surface_height) == false
+            || scale_logical_to_physical(metrics->logical_dst_offset_x,
+                                         surface_scale.numerator, surface_scale.denominator,
+                                         &metrics->physical_dst_offset_x) == false
+            || scale_logical_to_physical(metrics->logical_dst_offset_y,
+                                         surface_scale.numerator, surface_scale.denominator,
+                                         &metrics->physical_dst_offset_y) == false
+            || scale_logical_to_physical(metrics->logical_dst_width,
+                                         surface_scale.numerator, surface_scale.denominator,
+                                         &metrics->physical_dst_width) == false
+            || scale_logical_to_physical(metrics->logical_dst_height,
+                                         surface_scale.numerator, surface_scale.denominator,
+                                         &metrics->physical_dst_height) == false) {
+            MFB_LOG(MFB_LOG_ERROR,
+                    "WaylandMiniFB: fractional presentation metrics exceed the supported uint32 range at scale %u/120.",
+                    surface_scale.numerator);
+            return false;
+        }
+
+        metrics->use_fractional = true;
         if (metrics->physical_surface_width  == 0) { metrics->physical_surface_width  = 1; }
         if (metrics->physical_surface_height == 0) { metrics->physical_surface_height = 1; }
         // Clamp dst rect to physical surface bounds to prevent stretch_image
@@ -2531,13 +3021,13 @@ compute_presentation_metrics(const SWindowData *window_data,
         if (metrics->physical_dst_offset_y > metrics->physical_surface_height) {
             metrics->physical_dst_offset_y = metrics->physical_surface_height;
         }
-        if (metrics->physical_dst_offset_x + metrics->physical_dst_width > metrics->physical_surface_width) {
+        if (metrics->physical_dst_width > metrics->physical_surface_width - metrics->physical_dst_offset_x) {
             metrics->physical_dst_width = metrics->physical_surface_width - metrics->physical_dst_offset_x;
         }
-        if (metrics->physical_dst_offset_y + metrics->physical_dst_height > metrics->physical_surface_height) {
+        if (metrics->physical_dst_height > metrics->physical_surface_height - metrics->physical_dst_offset_y) {
             metrics->physical_dst_height = metrics->physical_surface_height - metrics->physical_dst_offset_y;
         }
-        return;
+        return true;
     }
 
     // 4A: integer HiDPI via wl_surface_set_buffer_scale.
@@ -2566,13 +3056,16 @@ compute_presentation_metrics(const SWindowData *window_data,
     metrics->physical_dst_offset_y   = metrics->logical_dst_offset_y   * applied_scale;
     metrics->physical_dst_width      = metrics->logical_dst_width      * applied_scale;
     metrics->physical_dst_height     = metrics->logical_dst_height     * applied_scale;
+    return true;
 }
 
+//-------------------------------------
+// Wait for and select a free slot without sizing it. Waiting may dispatch
+// presentation-state changes, so the required dimensions are computed later.
 //-------------------------------------
 static EWaylandSlotAcquireStatus
 acquire_presentation_slot(SWindowData *window_data,
                           SWindowData_Way *window_data_specific,
-                          const SWaylandPresentationMetrics *metrics,
                           SWaylandBufferSlot **out_slot) {
     *out_slot = NULL;
 
@@ -2582,6 +3075,11 @@ acquire_presentation_slot(SWindowData *window_data,
     }
 
     while (true) {
+        if (window_data->close == true
+            || window_data_specific->backend_unusable != 0) {
+            return WAYLAND_SLOT_ACQUIRE_ERROR;
+        }
+
         int start = window_data_specific->front_slot;
         for (int i = 0; i < WAYLAND_BUFFER_SLOTS; ++i) {
             int idx = (start + i) % WAYLAND_BUFFER_SLOTS;
@@ -2589,13 +3087,6 @@ acquire_presentation_slot(SWindowData *window_data,
 
             if (slot->busy) {
                 continue;
-            }
-
-            if (slot_ensure_buffer(slot, window_data_specific,
-                                   metrics->physical_surface_width,
-                                   metrics->physical_surface_height) == false) {
-                MFB_LOG(MFB_LOG_ERROR, "WaylandMiniFB: wl_buffer recreation failed for slot %d.", idx);
-                return WAYLAND_SLOT_ACQUIRE_ERROR;
             }
 
             *out_slot = slot;
@@ -2609,7 +3100,8 @@ acquire_presentation_slot(SWindowData *window_data,
             return WAYLAND_SLOT_ACQUIRE_ERROR;
         }
 
-        if (window_data->close == true) {
+        if (window_data->close == true
+            || window_data_specific->backend_unusable != 0) {
             return WAYLAND_SLOT_ACQUIRE_ERROR;
         }
 
@@ -2659,6 +3151,12 @@ present_presentation_buffer(SWindowData *window_data,
                             const SWaylandPresentationMetrics *metrics) {
     kUnused(window_data);
 
+    if (window_data_specific->throttle_callback != NULL) {
+        MFB_LOG(MFB_LOG_ERROR,
+                "WaylandMiniFB: cannot present while another throttle callback is pending.");
+        return MFB_STATE_INTERNAL_ERROR;
+    }
+
     // Attach buffer via surface_wrapper (render-path proxy).
     wl_surface_attach(window_data_specific->surface_wrapper, active_slot->wl_buf, 0, 0);
 
@@ -2686,11 +3184,19 @@ present_presentation_buffer(SWindowData *window_data,
                    (int32_t) metrics->physical_surface_width,
                    (int32_t) metrics->physical_surface_height);
 
+    // Request the throttle signal only after all fallible buffer work has
+    // completed, and immediately before the commit that makes a requested
+    // frame callback effective.
+    struct timespec callback_deadline;
+    if (surface_throttle_request(window_data_specific, &callback_deadline) == false) {
+        return MFB_STATE_INTERNAL_ERROR;
+    }
+
     wl_surface_commit(window_data_specific->surface_wrapper);
     active_slot->busy = 1;
 
-    // Sync fallback: when no frame callback is pending (throttle off or first
-    // frame), use wl_display_sync as a minimal throttle to avoid runaway submits.
+    // When no frame callback was requested, create a sync barrier after the
+    // surface commit so completion cannot precede server processing of that commit.
     if (window_data_specific->throttle_callback == NULL) {
         window_data_specific->throttle_callback =
             wl_display_sync(window_data_specific->render_display_wrapper);
@@ -2698,6 +3204,9 @@ present_presentation_buffer(SWindowData *window_data,
             MFB_LOG(MFB_LOG_ERROR, "WaylandMiniFB: wl_display_sync returned NULL.");
             return MFB_STATE_INTERNAL_ERROR;
         }
+        window_data_specific->throttle_deadline_seconds = (int64_t) callback_deadline.tv_sec;
+        window_data_specific->throttle_deadline_nanoseconds = (int32_t) callback_deadline.tv_nsec;
+        window_data_specific->throttle_deadline_valid = 1;
         wl_callback_add_listener(window_data_specific->throttle_callback,
                                  &g_throttle_listener, window_data_specific);
     }
@@ -2711,6 +3220,88 @@ present_presentation_buffer(SWindowData *window_data,
 }
 
 //-------------------------------------
+// Shared entry sequence of the public update functions.
+//
+// mfb_update_ex, mfb_update_events and mfb_wait_sync all validate the window,
+// honour a pending close, drain the owned queues and emit a deferred resize.
+// Keeping that sequence in one place is what stops one of the three paths from
+// silently missing a step.
+//-------------------------------------
+// Validates the window, destroys it when a close is already pending, and checks
+// that the display is still usable.
+//-------------------------------------
+static mfb_update_state
+begin_window_call(struct mfb_window *window, const char *func_name,
+                  SWindowData **window_data, SWindowData_Way **window_data_specific) {
+    if (get_window_data(window, func_name, window_data, window_data_specific) == false) {
+        return MFB_STATE_INVALID_WINDOW;
+    }
+
+    if ((*window_data)->close == true) {
+        MFB_LOG(MFB_LOG_DEBUG, "WaylandMiniFB: %s: window requested close.", func_name);
+        destroy(*window_data);
+        return MFB_STATE_EXIT;
+    }
+
+    if ((*window_data_specific)->display == NULL
+        || wl_display_get_error((*window_data_specific)->display) != 0) {
+        MFB_LOG(MFB_LOG_ERROR, "WaylandMiniFB: invalid Wayland display state during %s.", func_name);
+        return MFB_STATE_INTERNAL_ERROR;
+    }
+
+    if ((*window_data_specific)->backend_unusable != 0) {
+        MFB_LOG(MFB_LOG_ERROR, "WaylandMiniFB: %s cannot continue after a required Wayland global was removed.", func_name);
+        return MFB_STATE_INTERNAL_ERROR;
+    }
+
+    return MFB_STATE_OK;
+}
+
+//-------------------------------------
+// Resets the per-pump input state, drains the owned queues once without
+// blocking, and destroys the window if the dispatch delivered a close.
+//-------------------------------------
+static mfb_update_state
+pump_window_events(SWindowData *window_data, const char *func_name) {
+    // Reset scroll deltas before the event pump so newly dispatched values
+    // remain observable after the call returns.
+    window_data->mouse_wheel_x = 0.0f;
+    window_data->mouse_wheel_y = 0.0f;
+
+    if (dispatch_owned_non_blocking(window_data) == false) {
+        MFB_LOG(MFB_LOG_ERROR, "WaylandMiniFB: event dispatch failed in %s.", func_name);
+        return MFB_STATE_INTERNAL_ERROR;
+    }
+
+    if (window_data->close == true) {
+        MFB_LOG(MFB_LOG_DEBUG, "WaylandMiniFB: %s: window closed after event processing.", func_name);
+        destroy(window_data);
+        return MFB_STATE_EXIT;
+    }
+
+    SWindowData_Way *window_data_specific = (SWindowData_Way *) window_data->specific;
+    if (window_data_specific->backend_unusable != 0) {
+        MFB_LOG(MFB_LOG_ERROR, "WaylandMiniFB: %s cannot continue after a required Wayland global was removed.", func_name);
+        return MFB_STATE_INTERNAL_ERROR;
+    }
+
+    return MFB_STATE_OK;
+}
+
+//-------------------------------------
+// Emits the resize callback deferred by the latest configure, if any.
+//-------------------------------------
+static void
+emit_pending_resize(SWindowData *window_data) {
+    if (window_data->must_resize_context == false) {
+        return;
+    }
+
+    window_data->must_resize_context = false;
+    kCall(resize_func, window_data->window_width, window_data->window_height);
+}
+
+//-------------------------------------
 mfb_update_state
 mfb_update_ex(struct mfb_window *window, void *buffer, unsigned width, unsigned height) {
     uint32_t buffer_stride = 0;
@@ -2718,14 +3309,9 @@ mfb_update_ex(struct mfb_window *window, void *buffer, unsigned width, unsigned 
     SWindowData *window_data;
     SWindowData_Way *window_data_specific;
 
-    if (get_window_data(window, __func__, &window_data, &window_data_specific) == false) {
-        return MFB_STATE_INVALID_WINDOW;
-    }
-
-    if (window_data->close == true) {
-        MFB_LOG(MFB_LOG_ERROR, "WaylandMiniFB: mfb_update_ex aborted because the window is marked for close.");
-        destroy(window_data);
-        return MFB_STATE_EXIT;
+    mfb_update_state status = begin_window_call(window, __func__, &window_data, &window_data_specific);
+    if (status != MFB_STATE_OK) {
+        return status;
     }
 
     if (buffer == NULL) {
@@ -2738,27 +3324,15 @@ mfb_update_ex(struct mfb_window *window, void *buffer, unsigned width, unsigned 
         return MFB_STATE_INVALID_BUFFER;
     }
 
-    if (window_data_specific->display == NULL
-        || wl_display_get_error(window_data_specific->display) != 0) {
-        MFB_LOG(MFB_LOG_ERROR, "WaylandMiniFB: invalid Wayland display state during mfb_update_ex.");
-        return MFB_STATE_INTERNAL_ERROR;
-    }
-
-    // Reset scroll deltas before this event pump so newly dispatched values
-    // remain observable after mfb_update_ex returns.
-    window_data->mouse_wheel_x = 0.0f;
-    window_data->mouse_wheel_y = 0.0f;
-
     // 1. Dispatch window events (input, resize, close) non-blocking.
-    if (dispatch_owned_non_blocking(window_data) == false) {
-        MFB_LOG(MFB_LOG_ERROR, "WaylandMiniFB: event dispatch failed in mfb_update_ex.");
-        return MFB_STATE_INTERNAL_ERROR;
+    status = pump_window_events(window_data, __func__);
+    if (status != MFB_STATE_OK) {
+        return status;
     }
 
-    if (window_data->close == true) {
-        destroy(window_data);
-        return MFB_STATE_EXIT;
-    }
+    // Not called from mfb_wait_sync(), which would get a second chance to
+    // fire it in the same loop iteration.
+    wayland_emit_due_key_repeats(window_data, (SWindowData_Way *) window_data->specific);
 
     // Update buffer dimensions.
     if (window_data->buffer_width != width || window_data->buffer_height != height) {
@@ -2767,8 +3341,11 @@ mfb_update_ex(struct mfb_window *window, void *buffer, unsigned width, unsigned 
         window_data->buffer_stride = buffer_stride;
     }
 
-    // 2. Wait for PREVIOUS frame's callback (pipelined throttle).
-    if (surface_throttle(window_data) == false) {
+    // 2. Wait briefly for the PREVIOUS frame's callback. If the callback is
+    // still pending at its absolute deadline, skip this update instead of
+    // blocking indefinitely while the surface is not being presented.
+    EWaylandThrottleStatus throttle_status = surface_throttle_wait(window_data);
+    if (throttle_status == WAYLAND_THROTTLE_ERROR) {
         if (window_data->close == true) {
             destroy(window_data);
             return MFB_STATE_EXIT;
@@ -2777,19 +3354,20 @@ mfb_update_ex(struct mfb_window *window, void *buffer, unsigned width, unsigned 
         return MFB_STATE_INTERNAL_ERROR;
     }
 
+    if (throttle_status == WAYLAND_THROTTLE_SKIP) {
+        emit_pending_resize(window_data);
+        return MFB_STATE_OK;
+    }
+
     if (window_data->close == true) {
         destroy(window_data);
         return MFB_STATE_EXIT;
     }
 
-    // 3. Compute metrics AFTER dispatch (captures latest size from resize events).
-    SWaylandPresentationMetrics metrics;
-    compute_presentation_metrics(window_data, window_data_specific, &metrics);
-
-    // 4. Acquire a free buffer slot (blocks on render_queue if all busy).
+    // 3. Acquire a free buffer slot (blocks on render_queue if all busy).
     SWaylandBufferSlot *active_slot = NULL;
     EWaylandSlotAcquireStatus slot_status =
-        acquire_presentation_slot(window_data, window_data_specific, &metrics, &active_slot);
+        acquire_presentation_slot(window_data, window_data_specific, &active_slot);
 
     if (slot_status != WAYLAND_SLOT_ACQUIRE_OK || active_slot == NULL) {
         if (window_data->close == true) {
@@ -2799,13 +3377,27 @@ mfb_update_ex(struct mfb_window *window, void *buffer, unsigned width, unsigned 
         return MFB_STATE_INTERNAL_ERROR;
     }
 
+    // 4. Snapshot presentation state only after every path that can dispatch
+    // Wayland events has completed. No event dispatch is allowed from this
+    // point through the surface commit in present_presentation_buffer().
+    SWaylandPresentationMetrics metrics;
+    if (compute_presentation_metrics(window_data, window_data_specific, &metrics) == false) {
+        return MFB_STATE_INTERNAL_ERROR;
+    }
+
+    if (slot_ensure_buffer(active_slot, window_data_specific,
+                           metrics.physical_surface_width,
+                           metrics.physical_surface_height) == false) {
+        MFB_LOG(MFB_LOG_ERROR, "WaylandMiniFB: wl_buffer recreation failed for selected presentation slot.");
+        return MFB_STATE_INTERNAL_ERROR;
+    }
+
     // 5. Compose and present.
     compose_presentation_buffer(window_data, &metrics, buffer, active_slot->shm_ptr);
     mfb_update_state state = present_presentation_buffer(window_data, window_data_specific, active_slot, &metrics);
 
-    if (window_data->must_resize_context && state == MFB_STATE_OK) {
-        window_data->must_resize_context = false;
-        kCall(resize_func, window_data->window_width, window_data->window_height);
+    if (state == MFB_STATE_OK) {
+        emit_pending_resize(window_data);
     }
 
     return state;
@@ -2817,41 +3409,21 @@ mfb_update_events(struct mfb_window *window) {
     SWindowData *window_data;
     SWindowData_Way *window_data_specific;
 
-    if (get_window_data(window, __func__, &window_data, &window_data_specific) == false) {
-        return MFB_STATE_INVALID_WINDOW;
+    mfb_update_state status = begin_window_call(window, __func__, &window_data, &window_data_specific);
+    if (status != MFB_STATE_OK) {
+        return status;
     }
-
-    if (window_data->close == true) {
-        MFB_LOG(MFB_LOG_ERROR, "WaylandMiniFB: mfb_update_events aborted because the window is marked for close.");
-        destroy(window_data);
-        return MFB_STATE_EXIT;
-    }
-
-    if (window_data_specific->display == NULL
-        || wl_display_get_error(window_data_specific->display) != 0) {
-        MFB_LOG(MFB_LOG_ERROR, "WaylandMiniFB: invalid Wayland display state during mfb_update_events.");
-        return MFB_STATE_INTERNAL_ERROR;
-    }
-
-    window_data->mouse_wheel_x = 0.0f;
-    window_data->mouse_wheel_y = 0.0f;
 
     // Non-blocking dispatch of both queues for X11-like event polling behavior.
-    if (dispatch_owned_non_blocking(window_data) == false) {
-        MFB_LOG(MFB_LOG_ERROR, "WaylandMiniFB: event dispatch failed in mfb_update_events.");
-        return MFB_STATE_INTERNAL_ERROR;
+    status = pump_window_events(window_data, __func__);
+    if (status != MFB_STATE_OK) {
+        return status;
     }
 
-    if (window_data->close == true) {
-        MFB_LOG(MFB_LOG_ERROR, "WaylandMiniFB: mfb_update_events detected close request after event dispatch.");
-        destroy(window_data);
-        return MFB_STATE_EXIT;
-    }
+    // See mfb_update_ex().
+    wayland_emit_due_key_repeats(window_data, (SWindowData_Way *) window_data->specific);
 
-    if (window_data->must_resize_context) {
-        window_data->must_resize_context = false;
-        kCall(resize_func, window_data->window_width, window_data->window_height);
-    }
+    emit_pending_resize(window_data);
 
     return MFB_STATE_OK;
 }
@@ -2862,44 +3434,21 @@ mfb_wait_sync(struct mfb_window *window) {
     SWindowData *window_data;
     SWindowData_Way *window_data_specific;
 
-    if (get_window_data(window, __func__, &window_data, &window_data_specific) == false) {
+    if (begin_window_call(window, __func__, &window_data, &window_data_specific) != MFB_STATE_OK) {
         return false;
     }
 
-    if (window_data->close == true) {
-        MFB_LOG(MFB_LOG_ERROR, "WaylandMiniFB: mfb_wait_sync aborted because the window is marked for close.");
-        destroy(window_data);
-        return false;
-    }
-
-    if (window_data_specific->display == NULL) {
-        MFB_LOG(MFB_LOG_ERROR, "WaylandMiniFB: mfb_wait_sync has a null Wayland display handle.");
-        return false;
-    }
     if (window_data_specific->timer == NULL) {
         MFB_LOG(MFB_LOG_ERROR, "WaylandMiniFB: mfb_wait_sync missing frame timer state.");
         return false;
     }
 
-    window_data->mouse_wheel_x = 0.0f;
-    window_data->mouse_wheel_y = 0.0f;
-
     // Dispatch events once before pacing.
-    if (dispatch_owned_non_blocking(window_data) == false) {
-        MFB_LOG(MFB_LOG_ERROR, "WaylandMiniFB: event dispatch failed in mfb_wait_sync.");
+    if (pump_window_events(window_data, __func__) != MFB_STATE_OK) {
         return false;
     }
 
-    if (window_data->close == true) {
-        MFB_LOG(MFB_LOG_ERROR, "WaylandMiniFB: mfb_wait_sync aborted after dispatch because the window is marked for close.");
-        destroy(window_data);
-        return false;
-    }
-
-    if (window_data->must_resize_context) {
-        window_data->must_resize_context = false;
-        kCall(resize_func, window_data->window_width, window_data->window_height);
-    }
+    emit_pending_resize(window_data);
 
     // When hardware sync is active (frame callback provides timing) or
     // no target FPS is set, skip software pacing entirely.
@@ -2933,15 +3482,17 @@ mfb_wait_sync(struct mfb_window *window) {
         }
 
         if (window_data->close == true) {
-            MFB_LOG(MFB_LOG_ERROR, "WaylandMiniFB: mfb_wait_sync aborted during sync loop because the window is marked for close.");
+            MFB_LOG(MFB_LOG_DEBUG, "WaylandMiniFB: mfb_wait_sync: window closed during the sync loop.");
             destroy(window_data);
             return false;
         }
 
-        if (window_data->must_resize_context) {
-            window_data->must_resize_context = false;
-            kCall(resize_func, window_data->window_width, window_data->window_height);
+        if (window_data_specific->backend_unusable != 0) {
+            MFB_LOG(MFB_LOG_ERROR, "WaylandMiniFB: mfb_wait_sync cannot continue after a required Wayland global was removed.");
+            return false;
         }
+
+        emit_pending_resize(window_data);
     }
 
     mfb_timer_compensated_reset(window_data_specific->timer);
@@ -3026,6 +3577,12 @@ init_keycodes() {
     g_keycodes[KEY_NUMLOCK]    = MFB_KB_KEY_NUM_LOCK;
     g_keycodes[KEY_CAPSLOCK]   = MFB_KB_KEY_CAPS_LOCK;
     g_keycodes[KEY_PRINT]      = MFB_KB_KEY_PRINT_SCREEN;
+    // The kernel's HID table maps the physical keys below to these codes,
+    // not to KEY_PRINT/KEY_MENU above; keep both so devices that do emit the
+    // legacy codes still work.
+    g_keycodes[KEY_SYSRQ]      = MFB_KB_KEY_PRINT_SCREEN;
+    g_keycodes[KEY_COMPOSE]    = MFB_KB_KEY_MENU;
+    g_keycodes[KEY_102ND]      = MFB_KB_KEY_WORLD_2;
     g_keycodes[KEY_SCROLLLOCK] = MFB_KB_KEY_SCROLL_LOCK;
     g_keycodes[KEY_PAUSE]      = MFB_KB_KEY_PAUSE;
     g_keycodes[KEY_DELETE]     = MFB_KB_KEY_DELETE;
@@ -3116,8 +3673,13 @@ mfb_set_title(struct mfb_window *window, const char *title) {
     }
 
     kUnused(window_data);
+    if (window_data_specific->display == NULL || window_data_specific->toplevel == NULL) {
+        MFB_LOG(MFB_LOG_ERROR, "WaylandMiniFB: mfb_set_title cannot update a window without an active Wayland toplevel.");
+        return;
+    }
+
     xdg_toplevel_set_title(window_data_specific->toplevel, title);
-    wl_surface_commit(window_data_specific->surface);
+    flush_request(window_data_specific->display, "title update");
 }
 
 //-------------------------------------
@@ -3129,16 +3691,11 @@ mfb_get_monitor_scale(struct mfb_window *window, float *scale_x, float *scale_y)
         SWindowData *window_data = (SWindowData *) window;
         SWindowData_Way *window_data_specific = (SWindowData_Way *) window_data->specific;
         if (window_data_specific) {
-            if (window_data_specific->preferred_scale_120 > 0) {
-                float scale = (float) window_data_specific->preferred_scale_120 / WAYLAND_FRACTIONAL_SCALE_DENOMINATOR;
-                if (scale > 0.0f) {
-                    x = scale;
-                    y = scale;
-                }
-            }
-            else if (window_data_specific->integer_output_scale > 0) {
-                x = (float) window_data_specific->integer_output_scale;
-                y = (float) window_data_specific->integer_output_scale;
+            SWaylandResolvedScale surface_scale = resolve_surface_scale(window_data_specific);
+            float scale = (float) surface_scale.numerator / (float) surface_scale.denominator;
+            if (scale > 0.0f) {
+                x = scale;
+                y = scale;
             }
         }
     }
