@@ -271,7 +271,7 @@ mfb_open_ex(const char *title, unsigned width, unsigned height, unsigned flags) 
             return NULL;
         }
 
-        MTKView* view = [[MTKView alloc] initWithFrame:rectangle];
+        MTKView *view = [[MTKView alloc] initWithFrame:rectangle];
         if (view == nil) {
             MFB_LOG(MFB_LOG_ERROR, "MacMiniFB: failed to create MTKView.");
             destroy_window_data(window_data);
@@ -292,9 +292,16 @@ mfb_open_ex(const char *title, unsigned width, unsigned height, unsigned flags) 
         //[window_data->window updateSize];
     #endif
 
-        NSString *window_title = [NSString stringWithUTF8String:window_title_c];
+        char     *safe_title_c = mfb_safe_title_copy(window_title_c);
+        NSString *window_title  = nil;
+
+        if (safe_title_c != NULL) {
+            window_title = [NSString stringWithUTF8String:safe_title_c];
+            free(safe_title_c);
+        }
+
         if (window_title == nil) {
-            MFB_LOG(MFB_LOG_WARNING, "MacMiniFB: window title is not valid UTF-8; falling back to default title.");
+            MFB_LOG(MFB_LOG_WARNING, "MacMiniFB: the window title could not be used; falling back to the default title.");
             window_title = @"minifb";
         }
         [window_data_specific->window setTitle:window_title];
@@ -314,6 +321,9 @@ mfb_open_ex(const char *title, unsigned width, unsigned height, unsigned flags) 
 
         [NSApp activateIgnoringOtherApps:YES];
         [NSApp finishLaunching];
+
+        // A window can open with a key already held, and no event would ever report it.
+        sync_key_status(window_data);
 
         mfb_set_keyboard_callback((struct mfb_window *) window_data, keyboard_default);
 
@@ -639,7 +649,8 @@ init_keycodes() {
     g_keycodes[0x1E] = MFB_KB_KEY_RIGHT_BRACKET;
     g_keycodes[0x29] = MFB_KB_KEY_SEMICOLON;
     g_keycodes[0x2C] = MFB_KB_KEY_SLASH;
-    g_keycodes[0x0A] = MFB_KB_KEY_WORLD_1;
+    // The key next to left Shift, which every other backend also names WORLD_2.
+    g_keycodes[0x0A] = MFB_KB_KEY_WORLD_2;
 
     g_keycodes[0x33] = MFB_KB_KEY_BACKSPACE;
     g_keycodes[0x39] = MFB_KB_KEY_CAPS_LOCK;
@@ -763,7 +774,17 @@ mfb_set_title(struct mfb_window *window, const char *title) {
     }
 
     @autoreleasepool {
-        [window_data_specific->window setTitle:[NSString stringWithUTF8String:title]];
+        char *safe_title = mfb_safe_title_copy(title);
+
+        if (safe_title != NULL) {
+            // setTitle: with nil is not valid, and stringWithUTF8String: answers nil for
+            // anything it cannot decode.
+            NSString *new_title = [NSString stringWithUTF8String:safe_title];
+            free(safe_title);
+            if (new_title != nil) {
+                [window_data_specific->window setTitle:new_title];
+            }
+        }
     }
 }
 

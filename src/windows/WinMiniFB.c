@@ -154,8 +154,18 @@ get_error_message() {
 }
 
 //-------------------------------------
+// Windows lets a process set its DPI awareness only once, by the first call or by the
+// executable manifest, and refuses every later attempt with an access denied error.
+//-------------------------------------
 void
 dpi_aware() {
+    static bool dpi_awareness_requested = false;
+
+    if (dpi_awareness_requested == true) {
+        return;
+    }
+    dpi_awareness_requested = true;
+
     if (mfb_SetProcessDpiAwarenessContext != NULL) {
         if (mfb_SetProcessDpiAwarenessContext(MFB_DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) == false) {
             uint32_t error = GetLastError();
@@ -165,13 +175,20 @@ dpi_aware() {
                     error = GetLastError();
                 }
             }
-            if (error != NO_ERROR) {
+            if (error == ERROR_ACCESS_DENIED) {
+                MFB_LOG(MFB_LOG_INFO, "DPI awareness was not changed; it is probably already set by the application manifest or by an earlier call.");
+            }
+            else if (error != NO_ERROR) {
                 MFB_LOG(MFB_LOG_WARNING, "SetProcessDpiAwarenessContext failed: %s", get_error_message());
             }
         }
     }
     else if (mfb_SetProcessDpiAwareness != NULL) {
-        if (mfb_SetProcessDpiAwareness(mfb_PROCESS_PER_MONITOR_DPI_AWARE) != S_OK) {
+        HRESULT result = mfb_SetProcessDpiAwareness(mfb_PROCESS_PER_MONITOR_DPI_AWARE);
+        if (result == E_ACCESSDENIED) {
+            MFB_LOG(MFB_LOG_INFO, "DPI awareness was not changed; it is probably already set by the application manifest or by an earlier call.");
+        }
+        else if (result != S_OK) {
             MFB_LOG(MFB_LOG_WARNING, "SetProcessDpiAwareness failed: %s", get_error_message());
         }
     }
@@ -295,9 +312,73 @@ destroy_window_data(SWindowData *window_data) {
 }
 
 //-------------------------------------
+// Windows wants UTF-16. The shared helper has already validated the UTF-8 and warned if it
+// was not, so this only has to convert.
+//-------------------------------------
+static WCHAR *
+wide_from_utf8(const char *text) {
+    char  *safe  = mfb_safe_title_copy(text);
+    WCHAR *wide  = NULL;
+    int    count;
+
+    if (safe == NULL) {
+        return NULL;
+    }
+
+    count = MultiByteToWideChar(CP_UTF8, 0, safe, -1, NULL, 0);
+    if (count > 0) {
+        wide = (WCHAR *) malloc((size_t) count * sizeof(WCHAR));
+        if (wide != NULL && MultiByteToWideChar(CP_UTF8, 0, safe, -1, wide, count) == 0) {
+            free(wide);
+            wide = NULL;
+        }
+    }
+
+    free(safe);
+
+    return wide;
+}
+
+//-------------------------------------
 void     init_keycodes();
 uint32_t translate_mod();
 mfb_key  translate_key(unsigned int wParam, unsigned long lParam);
+
+//-------------------------------------
+// Rebuild the key state from the keyboard itself. Keys pressed or released while another
+// window had the focus produce no message here, so the buffer would otherwise only know
+// about what this window saw. GetKeyboardState and GetKeyState answer from the messages this
+// thread has read, which is exactly the state that is stale here, so ask the device instead.
+//-------------------------------------
+static void
+sync_key_status(SWindowData *window_data) {
+    memset(window_data->key_status, 0, sizeof(window_data->key_status));
+
+    for (unsigned virtual_key = 0; virtual_key < 256; ++virtual_key) {
+        // These report either side of the pair, so they cannot name a physical key.
+        if (virtual_key == VK_SHIFT || virtual_key == VK_CONTROL || virtual_key == VK_MENU) {
+            continue;
+        }
+
+        if ((GetAsyncKeyState((int) virtual_key) & 0x8000) == 0) {
+            continue;
+        }
+
+        UINT scancode = MapVirtualKey(virtual_key, MAPVK_VK_TO_VSC_EX);
+        if (scancode == 0) {
+            continue;
+        }
+
+        if ((scancode & 0xff00) == 0xe000) {
+            scancode = (scancode & 0xff) | 0x100;
+        }
+
+        mfb_key key_code = (mfb_key) g_keycodes[scancode & 0x1ff];
+        if (key_code != MFB_KB_KEY_UNKNOWN) {
+            window_data->key_status[key_code] = 1;
+        }
+    }
+}
 
 //-------------------------------------
 LRESULT CALLBACK
@@ -315,7 +396,7 @@ WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) {
             if (mfb_EnableNonClientDpiScaling)
                 mfb_EnableNonClientDpiScaling(hWnd);
 
-            return DefWindowProc(hWnd, message, wParam, lParam);
+            return DefWindowProcW(hWnd, message, wParam, lParam);
 
         // This message is only sent on Windows 10 v1703+ with Per Monitor v2 awareness
         case WM_GETDPISCALEDSIZE:
@@ -409,14 +490,29 @@ WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) {
         case WM_KEYUP:
         case WM_SYSKEYUP:
             if (window_data) {
-                mfb_key key_code      = translate_key((unsigned int) wParam, (unsigned long) lParam);
-                int is_pressed        = !((lParam >> 31) & 1);
-                window_data->mod_keys = translate_mod();
+                mfb_key key_code = translate_key((unsigned int) wParam, (unsigned long) lParam);
+                int     is_pressed = !((lParam >> 31) & 1);
 
-                if (key_code == MFB_KB_KEY_UNKNOWN)
+                if (key_code == MFB_KB_KEY_UNKNOWN) {
+                    window_data->mod_keys = translate_mod();
                     return FALSE;
+                }
+
+                // Windows never sends the key down for Print Screen, only the key up.
+                if (key_code == MFB_KB_KEY_PRINT_SCREEN && is_pressed == 0) {
+                    window_data->key_status[key_code] = 1;
+                    mfb_recalc_mod_keys(window_data, translate_mod());
+                    kCall(keyboard_func, key_code, window_data->mod_keys, true);
+                }
+
+                // The key up for the Windows key arrives after update_events released it
+                // by hand.
+                if (is_pressed == 0 && window_data->key_status[key_code] == 0) {
+                    break;
+                }
 
                 window_data->key_status[key_code] = (uint8_t) is_pressed;
+                mfb_recalc_mod_keys(window_data, translate_mod());
                 kCall(keyboard_func, key_code, window_data->mod_keys, is_pressed);
             }
             break;
@@ -440,7 +536,7 @@ WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) {
                         codepoint = (WCHAR) wParam;
                     }
                     window_data_specific->high_surrogate = 0;
-                    kCall(char_input_func, codepoint);
+                    mfb_dispatch_char_input(window_data, codepoint);
                 }
             }
             break;
@@ -453,7 +549,7 @@ WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) {
                     return TRUE;
                 }
 
-                kCall(char_input_func, (unsigned int) wParam);
+                mfb_dispatch_char_input(window_data, (uint32_t) wParam);
             }
             break;
 
@@ -471,8 +567,9 @@ WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) {
         //case WM_XBUTTONDBLCLK:
             if (window_data) {
                 mfb_mouse_button button = MFB_MOUSE_BTN_0;
-                window_data->mod_keys   = translate_mod();
                 int          is_pressed = 0;
+
+                mfb_recalc_mod_keys(window_data, translate_mod());
 
                 switch(message) {
                     //case WM_LBUTTONDBLCLK:
@@ -545,7 +642,8 @@ WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) {
         case WM_MOUSEWHEEL:
             if (window_data) {
                 window_data->mouse_wheel_y = (SHORT) HIWORD(wParam) / (float) WHEEL_DELTA;
-                kCall(mouse_wheel_func, translate_mod(), 0.0f, window_data->mouse_wheel_y);
+                mfb_recalc_mod_keys(window_data, translate_mod());
+                kCall(mouse_wheel_func, window_data->mod_keys, 0.0f, window_data->mouse_wheel_y);
             }
             break;
 
@@ -554,7 +652,8 @@ WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) {
             // NOTE: The X-axis is inverted for consistency with macOS and X11
             if (window_data) {
                 window_data->mouse_wheel_x = -((SHORT) HIWORD(wParam) / (float) WHEEL_DELTA);
-                kCall(mouse_wheel_func, translate_mod(), window_data->mouse_wheel_x, 0.0f);
+                mfb_recalc_mod_keys(window_data, translate_mod());
+                kCall(mouse_wheel_func, window_data->mod_keys, window_data->mouse_wheel_x, 0.0f);
             }
             break;
 
@@ -590,6 +689,10 @@ WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) {
                     return res;
                 }
 
+                // Restoring a minimized window sends WM_SIZE with the size it already had.
+                bool size_changed = window_data->window_width  != LOWORD(lParam) ||
+                                    window_data->window_height != HIWORD(lParam);
+
                 window_data->window_width  = LOWORD(lParam);
                 window_data->window_height = HIWORD(lParam);
                 resize_dst(window_data, window_data->window_width, window_data->window_height);
@@ -601,7 +704,8 @@ WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) {
 #else
                 resize_GL(window_data);
 #endif
-                if (window_data->window_width != 0 && window_data->window_height != 0) {
+                if (size_changed == true &&
+                    window_data->window_width != 0 && window_data->window_height != 0) {
                     MFB_LOG(MFB_LOG_DEBUG, "WM_SIZE: window=%ux%u framebuffer=%ux%u",
                             window_data->window_width, window_data->window_height,
                             window_data->buffer_width, window_data->buffer_height);
@@ -613,6 +717,9 @@ WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) {
         case WM_SETFOCUS:
             if (window_data) {
                 window_data->is_active = true;
+                sync_key_status(window_data);
+                // Nothing else reports a lock toggled while another window had the focus.
+                mfb_recalc_mod_keys(window_data, translate_mod());
                 kCall(active_func, true);
             }
             break;
@@ -621,14 +728,38 @@ WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) {
             if (window_data) {
                 window_data->is_active = false;
                 kCall(active_func, false);
+                mfb_release_held_keys(window_data, translate_mod());
             }
             break;
 
         default:
-            res = DefWindowProc(hWnd, message, wParam, lParam);
+            res = DefWindowProcW(hWnd, message, wParam, lParam);
     }
 
     return res;
+}
+
+//-------------------------------------
+// Windows sends no key up for the first Shift released while both are down, and none for the
+// Windows key after shortcuts such as Win+V. Both would stay pressed forever.
+//-------------------------------------
+static void
+release_key_lost_by_system(SWindowData *window_data, int virtual_key, mfb_key key_code) {
+    if (window_data->key_status[key_code] == 0) {
+        return;
+    }
+
+    if ((GetKeyState(virtual_key) & 0x8000) != 0) {
+        return;
+    }
+
+    const uint32_t lock_bits = (uint32_t) (MFB_KB_MOD_CAPS_LOCK | MFB_KB_MOD_NUM_LOCK);
+
+    window_data->key_status[key_code] = 0;
+    // The locks have no second source, and GetKeyState here answers for the focused window.
+    mfb_recalc_mod_keys(window_data,
+                        (translate_mod() & ~lock_bits) | (window_data->mod_keys & lock_bits));
+    kCall(keyboard_func, key_code, window_data->mod_keys, false);
 }
 
 //-------------------------------------
@@ -641,9 +772,16 @@ update_events(SWindowData *window_data, HWND window) {
         window_data->mouse_wheel_y = 0.0f;
     }
 
-    while (PeekMessage(&msg, window, 0, 0, PM_REMOVE)) {
+    while (PeekMessageW(&msg, window, 0, 0, PM_REMOVE)) {
         TranslateMessage(&msg);
-        DispatchMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+
+    if (window_data != NULL && window_data->is_active == true) {
+        release_key_lost_by_system(window_data, VK_LSHIFT, MFB_KB_KEY_LEFT_SHIFT);
+        release_key_lost_by_system(window_data, VK_RSHIFT, MFB_KB_KEY_RIGHT_SHIFT);
+        release_key_lost_by_system(window_data, VK_LWIN, MFB_KB_KEY_LEFT_SUPER);
+        release_key_lost_by_system(window_data, VK_RWIN, MFB_KB_KEY_RIGHT_SUPER);
     }
 }
 
@@ -792,9 +930,9 @@ mfb_open_ex(const char *title, unsigned width, unsigned height, unsigned flags) 
     // Disable Double Clicks Not adding CS_DBLCLKS
     window_data_specific->wc.style         = CS_OWNDC | CS_VREDRAW | CS_HREDRAW;
     window_data_specific->wc.lpfnWndProc   = WndProc;
-    window_data_specific->wc.hCursor       = LoadCursor(0, IDC_ARROW);
-    window_data_specific->wc.lpszClassName = "minifb";
-    if (RegisterClass(&window_data_specific->wc) == 0) {
+    window_data_specific->wc.hCursor       = LoadCursor(NULL, IDC_ARROW);
+    window_data_specific->wc.lpszClassName = L"minifb";
+    if (RegisterClassW(&window_data_specific->wc) == 0) {
         uint32_t error = GetLastError();
         if (error != ERROR_CLASS_ALREADY_EXISTS) {
             MFB_LOG(MFB_LOG_ERROR, "RegisterClass failed: %s", get_error_message());
@@ -807,16 +945,19 @@ mfb_open_ex(const char *title, unsigned width, unsigned height, unsigned flags) 
 
     calc_dst_factor(window_data, width, height);
 
-    window_data_specific->window = CreateWindowEx(
+    WCHAR *wide_title = wide_from_utf8(window_title);
+
+    window_data_specific->window = CreateWindowExW(
         0,
-        "minifb", window_title,
+        L"minifb", wide_title,
         window_style,
         x, y,
         rect.right, rect.bottom,
         0, 0, 0, 0);
+    free(wide_title);
 
     if (!window_data_specific->window) {
-        MFB_LOG(MFB_LOG_ERROR, "CreateWindowEx failed: %s", get_error_message());
+        MFB_LOG(MFB_LOG_ERROR, "CreateWindowExW failed: %s", get_error_message());
         free(window_data);
         free(window_data_specific);
         release_window_counter();
@@ -1225,17 +1366,8 @@ translate_key(unsigned int wParam, unsigned long lParam) {
         return MFB_KB_KEY_KP_EQUAL;
 
     if (wParam == VK_CONTROL) {
-        MSG   next;
-        DWORD time;
-
         if (lParam & 0x01000000)
             return MFB_KB_KEY_RIGHT_CONTROL;
-
-        time = GetMessageTime();
-        if (PeekMessageW(&next, NULL, 0, 0, PM_NOREMOVE))
-            if (next.message == WM_KEYDOWN || next.message == WM_SYSKEYDOWN || next.message == WM_KEYUP || next.message == WM_SYSKEYUP)
-                if (next.wParam == VK_MENU && (next.lParam & 0x01000000) && next.time == time)
-                    return MFB_KB_KEY_UNKNOWN;
 
         return MFB_KB_KEY_LEFT_CONTROL;
     }
@@ -1311,7 +1443,12 @@ mfb_set_title(struct mfb_window *window, const char *title) {
         return;
     }
 
-    SetWindowTextA(window_data_specific->window, title);
+    WCHAR *wide_title = wide_from_utf8(title);
+
+    if (wide_title != NULL) {
+        SetWindowTextW(window_data_specific->window, wide_title);
+        free(wide_title);
+    }
 }
 
 //-------------------------------------
