@@ -256,9 +256,13 @@ On Android and iOS, touch positions carry the pointer id in their upper bits:
 
 - `mfb_get_mouse_x()`, `mfb_get_mouse_y()` and the `x`/`y` given to `mfb_mouse_move_func` are packed values. Decode them with `mfb_decode_touch()`, or one at a time with `mfb_decode_touch_pos()` / `mfb_decode_touch_id()`. On desktop, Web and DOS the id is always `0`.
 - The pointer id also arrives as the `button` argument of `mfb_mouse_button_func` (`MFB_MOUSE_BTN_0`..`MFB_MOUSE_BTN_7`).
-- An external mouse on Android is the exception: it reports the real button, like the desktop backends. The device goes in the packed pointer id instead. A mouse or hovering stylus always reports `MFB_POINTER_ID_MOUSE`, a finger always a lower id, so `mfb_decode_touch_id(mfb_get_mouse_x(window)) == MFB_POINTER_ID_MOUSE` tells them apart.
+- An external mouse on Android is the exception: it reports the real button, like the desktop backends. The device goes in the packed pointer id instead. A mouse or hovering stylus reports `MFB_POINTER_ID_MOUSE`, and fingers take the ids Android hands out, starting at `0`, so `mfb_decode_touch_id(mfb_get_mouse_x(window)) == MFB_POINTER_ID_MOUSE` tells them apart.
+
+Positive Y is up and positive X is left, on every backend. One wheel notch is worth about `1.0`, but the exact amount belongs to the device: a trackpad sends a stream of fractions that can add up to a fifth of a notch for a whole gesture, so read the sign and accumulate rather than comparing against a value.
 
 `mfb_get_mouse_scroll_x()` and `mfb_get_mouse_scroll_y()` only hold the delta of the last event pump: MiniFB sets them to `0.0f` before pumping events, then writes the delta if a scroll event arrives during that pump.
+
+With more than one window on Windows or macOS the pump drains the whole thread queue, so a scroll belonging to another window can be delivered there and cleared before that window reads it. `mfb_mouse_scroll_func` is not affected and is the reliable source.
 
 ### Per-Window Data
 
@@ -1102,7 +1106,9 @@ This will generate DOS 32-bit `.exe` files in the `build-dos/` folder which you 
 
 The DOS backend cannot support multi-window applications, so the examples `multiple_windows.c` and `hidpi.c` do not run correctly.
 
-It also does not tell extended (`E0`-prefixed) scancodes apart from their base ones: the keypad and cursor-block keys that share a scancode report the same `mfb_key`, and right Ctrl and Alt report as the left ones. Extended Up/Down are the exception: they arrive as mouse wheel events, because some DOS mouse drivers emulate the wheel that way.
+It also does not tell extended (`E0`-prefixed) scancodes apart from their base ones: the keypad and cursor-block keys that share a scancode report the same `mfb_key`, and right Ctrl and Alt report as the left ones.
+
+Some DOS mouse drivers emulate a wheel by injecting extended Up/Down keys. Reading those as scroll costs the arrow keys, which send the same scancodes, so it is off by default. Define `MINIFB_DOS_WHEEL_FROM_ARROW_KEYS` when building MiniFB to turn it on.
 
 The `dos` example target (`examples/dos/debug_dos.c`) is a GDB-stub debugging sample. In a `Debug` build it calls `gdb_start()` and waits for a debugger connection. If you want a regular visual test, run `noise` or `input_events` instead.
 
