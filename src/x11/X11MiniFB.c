@@ -906,10 +906,6 @@ mfb_update_ex(struct mfb_window *window, void *buffer, unsigned width, unsigned 
         return MFB_STATE_INVALID_WINDOW;
     }
 
-#if !defined(USE_OPENGL_API)
-    bool different_size = false;
-#endif
-
     if (window_data->buffer_width != width || window_data->buffer_height != height) {
         if (buffer_stride > (uint32_t) INT_MAX) {
             MFB_LOG(MFB_LOG_ERROR, "X11MiniFB: buffer stride for size %ux%u exceeds XImage limit.", width, height);
@@ -918,23 +914,38 @@ mfb_update_ex(struct mfb_window *window, void *buffer, unsigned width, unsigned 
         window_data->buffer_width  = width;
         window_data->buffer_stride = buffer_stride;
         window_data->buffer_height = height;
-#if !defined(USE_OPENGL_API)
-        different_size = true;
-#endif
     }
 
 #if !defined(USE_OPENGL_API)
 
-    if (different_size || window_data->buffer_width != window_data->dst_width || window_data->buffer_height != window_data->dst_height) {
-        if (window_data_specific->image_scaler_width != window_data->dst_width || window_data_specific->image_scaler_height != window_data->dst_height) {
+    if (window_data_specific->image == NULL) {
+        MFB_LOG(MFB_LOG_ERROR, "X11MiniFB: missing base XImage in mfb_update_ex.");
+        return MFB_STATE_INTERNAL_ERROR;
+    }
+
+    // The base XImage keeps the size given at open time, so it can only wrap the
+    // caller's buffer directly when the buffer still has that size.
+    bool use_scaler = window_data->buffer_width  != window_data->dst_width ||
+                      window_data->buffer_height != window_data->dst_height ||
+                      window_data->buffer_width  != (uint32_t) window_data_specific->image->width ||
+                      window_data->buffer_height != (uint32_t) window_data_specific->image->height;
+
+    if (use_scaler == true) {
+        if (window_data_specific->image_scaler == NULL ||
+            window_data_specific->image_scaler_width != window_data->dst_width || window_data_specific->image_scaler_height != window_data->dst_height) {
             if (window_data_specific->image_scaler != NULL) {
                 window_data_specific->image_scaler->data = NULL;
                 XDestroyImage(window_data_specific->image_scaler);
+                window_data_specific->image_scaler        = NULL;
+                window_data_specific->image_scaler_width  = 0;
+                window_data_specific->image_scaler_height = 0;
             }
+
             if (window_data_specific->image_buffer != NULL) {
                 free(window_data_specific->image_buffer);
                 window_data_specific->image_buffer = NULL;
             }
+
             int depth = DefaultDepth(display, window_data_specific->screen);
             uint32_t scaler_stride = 0;
             size_t scaler_size = 0;
@@ -963,17 +974,13 @@ mfb_update_ex(struct mfb_window *window, void *buffer, unsigned width, unsigned 
         }
     }
 
-    if (window_data_specific->image_scaler != NULL) {
+    if (use_scaler == true) {
         stretch_image((uint32_t *) buffer, 0, 0, window_data->buffer_width, window_data->buffer_height, window_data->buffer_width,
                       (uint32_t *) window_data_specific->image_buffer, 0, 0, window_data->dst_width, window_data->dst_height, window_data->dst_width);
         window_data_specific->image_scaler->data = (char *) window_data_specific->image_buffer;
         XPutImage(display, window_data_specific->window, window_data_specific->gc, window_data_specific->image_scaler, 0, 0, window_data->dst_offset_x, window_data->dst_offset_y, window_data->dst_width, window_data->dst_height);
     }
     else {
-        if (window_data_specific->image == NULL) {
-            MFB_LOG(MFB_LOG_ERROR, "X11MiniFB: missing base XImage in mfb_update_ex.");
-            return MFB_STATE_INTERNAL_ERROR;
-        }
         window_data_specific->image->data = (char *) buffer;
         XPutImage(display, window_data_specific->window, window_data_specific->gc, window_data_specific->image, 0, 0, window_data->dst_offset_x, window_data->dst_offset_y, window_data->dst_width, window_data->dst_height);
     }

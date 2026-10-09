@@ -584,7 +584,8 @@ sudo apt-get install -y \
     pkg-config \
     libwayland-dev \
     libxkbcommon-dev \
-    wayland-protocols
+    wayland-protocols \
+    libdecor-0-dev
 ```
 
 - **build-essential**: Compiler toolchain (gcc, g++, make)
